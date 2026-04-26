@@ -70,21 +70,34 @@ GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 BOLD='\033[1m'
-NC='\033[0m' # No Color
+DIM='\033[2;37m'
+PINK='\033[38;2;214;8;107m'   # Fido brand pink (#d6086b)
+NC='\033[0m'
 
 info()    { echo -e "${BLUE}ℹ${NC}  $1"; }
 success() { echo -e "${GREEN}✔${NC}  $1"; }
 warn()    { echo -e "${YELLOW}⚠${NC}  $1"; }
 fail()    { echo -e "${RED}✖${NC}  $1"; }
 
-echo ""
-echo -e "${BOLD}══════════════════════════════════════════════════${NC}"
+# Banner — slant-figlet "Fido Installer", Fido pink, with subtitle.
+print_banner() {
+    echo ""
+    echo -e "${BOLD}${PINK}    _______     __         ____           __        ____         ${NC}"
+    echo -e "${BOLD}${PINK}   / ____(_)___/ /___     /  _/___  _____/ /_____ _/ / /__  _____${NC}"
+    echo -e "${BOLD}${PINK}  / /_  / / __  / __ \\    / // __ \\/ ___/ __/ __ \`/ / / _ \\/ ___/${NC}"
+    echo -e "${BOLD}${PINK} / __/ / / /_/ / /_/ /  _/ // / / (__  ) /_/ /_/ / / /  __/ /    ${NC}"
+    echo -e "${BOLD}${PINK}/_/   /_/\\__,_/\\____/  /___/_/ /_/____/\\__/\\__,_/_/_/\\___/_/     ${NC}"
+    echo -e "${DIM}                                                  by platform team${NC}"
+    echo ""
+}
+
+print_banner
+
 if [ "$MCP_ONLY" = "1" ]; then
-    echo -e "${BOLD}   Fido MCP Servers — Install${NC}"
+    echo -e "${BOLD}   MCP Servers only${NC}"
 else
-    echo -e "${BOLD}   Fido Agents — Setup & Update${NC}"
+    echo -e "${BOLD}   Setup & update${NC}"
 fi
-echo -e "${BOLD}══════════════════════════════════════════════════${NC}"
 echo ""
 
 # Initialize counters so they're safe when --mcp-only skips the repo section.
@@ -122,7 +135,7 @@ else
     success "Homebrew is installed"
 fi
 
-# ── Step 3: Ensure CLI tools (gh, fzf) ──────────────────────────
+# ── Step 3: Ensure CLI tools (gh, fzf, awscli) ──────────────────
 install_brew_pkg() {
     local cmd="$1" pkg="$2" label="$3"
     if command -v "$cmd" &> /dev/null; then
@@ -134,8 +147,73 @@ install_brew_pkg() {
     fi
 }
 
-install_brew_pkg gh  gh  "GitHub CLI"
-install_brew_pkg fzf fzf "fzf (nice multi-select UI)"
+install_brew_pkg gh  gh      "GitHub CLI"
+install_brew_pkg fzf fzf     "fzf (nice multi-select UI)"
+install_brew_pkg aws awscli  "AWS CLI"
+
+# AWS VPN Client — installed as a Homebrew cask (handles arch under the hood).
+if brew list --cask aws-vpn-client &> /dev/null; then
+    success "AWS VPN Client is installed"
+else
+    info "Installing AWS VPN Client (cask — may prompt for your Mac password)..."
+    brew install --cask aws-vpn-client
+    success "AWS VPN Client installed"
+fi
+
+# AWS VPN Client profile — let the user paste the .ovpn or point at a file.
+# Saved to ~/Documents/fido-vpn.ovpn so the user can import it via the
+# AWS VPN Client GUI (it has no CLI for profile add on macOS).
+echo ""
+echo -e "${BOLD}── AWS VPN Client profile ──${NC}"
+echo ""
+info "AWS VPN Client needs a Fido profile (.ovpn file) to connect."
+if [ -t 0 ]; then
+    echo -e "  ${BOLD}1)${NC} Paste config — I'll read until you press ${BOLD}Ctrl-D${NC}"
+    echo -e "  ${BOLD}2)${NC} Provide a path to a .ovpn file"
+    echo -e "  ${BOLD}s)${NC} Skip (set it up later in the AWS VPN Client UI)"
+    read -r -p "  > " vpn_choice
+
+    VPN_PROFILE_DIR="${HOME}/Documents"
+    VPN_PROFILE_PATH=""
+
+    case "${vpn_choice:-s}" in
+        1)
+            echo ""
+            info "Paste the full .ovpn content, then press ${BOLD}Ctrl-D${NC} on a blank line:"
+            vpn_content="$(cat)"
+            if [ -n "$vpn_content" ]; then
+                mkdir -p "$VPN_PROFILE_DIR"
+                VPN_PROFILE_PATH="${VPN_PROFILE_DIR}/fido-vpn.ovpn"
+                printf '%s\n' "$vpn_content" > "$VPN_PROFILE_PATH"
+                success "Saved VPN config to ${BOLD}${VPN_PROFILE_PATH}${NC}"
+            else
+                warn "Empty paste — skipping"
+            fi
+            ;;
+        2)
+            read -r -p "  Path to .ovpn: " vpn_src
+            vpn_src="${vpn_src/#\~/$HOME}"
+            if [ -f "$vpn_src" ]; then
+                mkdir -p "$VPN_PROFILE_DIR"
+                VPN_PROFILE_PATH="${VPN_PROFILE_DIR}/fido-vpn.ovpn"
+                cp "$vpn_src" "$VPN_PROFILE_PATH"
+                success "Copied VPN config to ${BOLD}${VPN_PROFILE_PATH}${NC}"
+            else
+                warn "File not found: ${vpn_src} — skipping"
+            fi
+            ;;
+        s|S|*) info "Skipped — set up the profile later via AWS VPN Client → File → Manage Profiles → Add Profile" ;;
+    esac
+
+    if [ -n "$VPN_PROFILE_PATH" ]; then
+        info "To finish: open ${BOLD}AWS VPN Client${NC}, then ${BOLD}File → Manage Profiles → Add Profile${NC}, and select:"
+        info "  ${BOLD}${VPN_PROFILE_PATH}${NC}"
+        info "Tip: ${BOLD}open -a 'AWS VPN Client'${NC} launches the app."
+    fi
+else
+    info "Non-interactive run — skipping VPN profile prompt"
+fi
+echo ""
 
 # Claude Code — installed via the official installer (not brew)
 if command -v claude &> /dev/null; then
@@ -433,6 +511,64 @@ else
 fi
 echo ""
 
+# ── Step 12: Symlink ~/fido-money → roman/ ──────────────────────
+# The user-facing entry point is `~/fido-money` so people don't have to
+# remember the fido-agent/roman/ nesting. Idempotent: -n stops `ln` from
+# descending into an existing symlink; -f replaces it.
+FIDO_MONEY_LINK="${HOME}/fido-money"
+if [ -e "$FIDO_MONEY_LINK" ] && [ ! -L "$FIDO_MONEY_LINK" ]; then
+    warn "${FIDO_MONEY_LINK} already exists and isn't a symlink — leaving it alone"
+else
+    ln -sfn "$ROMAN_DIR" "$FIDO_MONEY_LINK"
+    success "Symlinked ${BOLD}${FIDO_MONEY_LINK}${NC} → ${ROMAN_DIR}"
+fi
+echo ""
+
+# ── Step 13: Clone Fido Skills repo to a user-chosen location ───
+echo -e "${BOLD}── Fido Skills (Claude Code skills) ──${NC}"
+echo ""
+info "FidoMoney/skills is a private repo of Claude Code skills curated by Fido."
+echo ""
+
+DEFAULT_SKILLS_DIR="${HOME}/.claude/skills/fido"
+if [ -t 0 ]; then
+    echo -e "  Where should it be cloned?"
+    echo -e "    ${BOLD}1)${NC} ${DEFAULT_SKILLS_DIR}  ${DIM}(user-scope, picked up by every Claude session)${NC}"
+    echo -e "    ${BOLD}2)${NC} ${HOME}/fido-money/skills-repo  ${DIM}(colocated with the install)${NC}"
+    echo -e "    ${BOLD}3)${NC} Custom path"
+    echo -e "    ${BOLD}s)${NC} Skip"
+    read -r -p "  > " skills_choice
+    case "${skills_choice:-1}" in
+        1|"") SKILLS_REPO_DIR="$DEFAULT_SKILLS_DIR" ;;
+        2)    SKILLS_REPO_DIR="${HOME}/fido-money/skills-repo" ;;
+        3)    read -r -p "  Path: " SKILLS_REPO_DIR ;;
+        s|S)  SKILLS_REPO_DIR="" ;;
+        *)    SKILLS_REPO_DIR="$DEFAULT_SKILLS_DIR" ;;
+    esac
+else
+    SKILLS_REPO_DIR="$DEFAULT_SKILLS_DIR"
+fi
+
+if [ -n "$SKILLS_REPO_DIR" ]; then
+    SKILLS_REPO_DIR="${SKILLS_REPO_DIR/#\~/$HOME}"   # tilde expansion
+    if [ -d "${SKILLS_REPO_DIR}/.git" ]; then
+        info "Skills repo already at ${SKILLS_REPO_DIR} — pulling latest..."
+        (cd "$SKILLS_REPO_DIR" && git fetch --all --prune --quiet && git reset --hard origin/main --quiet) \
+            && success "Skills updated" \
+            || warn "Skills update failed"
+    else
+        mkdir -p "$(dirname "$SKILLS_REPO_DIR")"
+        if gh repo clone "${ORG}/skills" "$SKILLS_REPO_DIR" -- --quiet 2>/dev/null; then
+            success "Skills cloned to ${BOLD}${SKILLS_REPO_DIR}${NC}"
+        else
+            warn "Could not clone ${ORG}/skills — check your access permissions"
+        fi
+    fi
+else
+    info "Skipped skills clone"
+fi
+echo ""
+
 # ── Summary ──────────────────────────────────────────────────────
 echo -e "${BOLD}══════════════════════════════════════════════════${NC}"
 echo -e "${BOLD}   Setup Complete${NC}"
@@ -443,8 +579,8 @@ success "Repos up to date:   ${UPDATED}"
 [ "$UPDATE_FAILED" -gt 0 ] && warn "Need attention:     ${UPDATE_FAILED}"
 [ "$CLONE_FAILED" -gt 0 ]  && warn "Clone failures:     ${CLONE_FAILED} (check access permissions)"
 echo ""
-success "fido-agent is in:  ${BOLD}${AGENT_REPO_DIR}${NC}"
-success "Roman code is in:  ${BOLD}${ROMAN_DIR}${NC}"
+success "Roman is at:       ${BOLD}${FIDO_MONEY_LINK}${NC}"
+[ -n "$SKILLS_REPO_DIR" ] && [ -d "$SKILLS_REPO_DIR" ] && success "Fido Skills:       ${BOLD}${SKILLS_REPO_DIR}${NC}"
 echo ""
 
 fi  # end of `if [ "$MCP_ONLY" = "0" ]`
@@ -501,7 +637,7 @@ if [ "$SKIP_MCP" = "1" ]; then
     info "Skipping MCP install (--skip-mcp / SKIP_MCP_INSTALL=1)"
     echo ""
     if [ "$MCP_ONLY" = "0" ]; then
-        echo -e "  ${BOLD}To use Roman${NC}:  ${BOLD}cd ${ROMAN_DIR} && claude${NC}"
+        echo -e "  ${BOLD}To use Roman${NC}:  ${BOLD}cd ~/fido-money && claude${NC}"
         echo ""
     fi
     exit 0
@@ -556,6 +692,20 @@ fi
 success "Found ${BOLD}${#MCP_CATALOG[@]}${NC} MCP servers"
 echo ""
 
+# Quick "install all" shortcut. Skipped when --all/--only already pinned a
+# selection or when stdin isn't interactive.
+if [ "$MCP_MODE" = "interactive" ] && [ -t 0 ]; then
+    echo -e "${BOLD}Quick option:${NC} install ${BOLD}all ${#MCP_CATALOG[@]}${NC} MCP servers in one shot."
+    echo -e "${DIM}  • Press ${NC}${BOLD}Y${NC}${DIM} (or Enter) to install everything${NC}"
+    echo -e "${DIM}  • Press ${NC}${BOLD}N${NC}${DIM} to pick servers from a list${NC}"
+    read -r -p "  Install all? [Y/n] " reply
+    case "${reply:-Y}" in
+        n|N|no|NO) ;;
+        *) MCP_MODE="all"; info "Installing all MCPs..." ;;
+    esac
+    echo ""
+fi
+
 # Token — flag / env / prompt.
 if [ -z "$MCP_TOKEN" ]; then
     if [ -t 0 ]; then
@@ -573,19 +723,36 @@ echo ""
 
 # DNS resolver.
 if [ "$MCP_SKIP_DNS" = "0" ]; then
-    resolver_file="/etc/resolver/${MCP_DNS_DOMAIN}"
-    if [ -f "$resolver_file" ] && grep -q "$MCP_DNS_NAMESERVER" "$resolver_file"; then
-        success "DNS resolver already configured"
-    else
-        info "Configuring DNS resolver for *.${MCP_DNS_DOMAIN} → ${MCP_DNS_NAMESERVER} (sudo)"
+    # All zones we need to resolve over the VPN. Each entry is "<zone>:<ns_ip>".
+    # MCP servers live under global-private.fido.money; private.fido.money is
+    # used by other Fido internal services (RDS, ElastiCache, etc.) and is
+    # needed for many of the MCPs to talk to their backing data sources.
+    MCP_DNS_ZONES=(
+        "global-private.fido.money:10.3.0.2"
+        "private.fido.money:10.30.0.2"
+    )
+
+    sudo_prompted=0
+    for zone_entry in "${MCP_DNS_ZONES[@]}"; do
+        zone="${zone_entry%%:*}"
+        ns="${zone_entry##*:}"
+        resolver_file="/etc/resolver/${zone}"
+        if [ -f "$resolver_file" ] && grep -q "$ns" "$resolver_file"; then
+            success "DNS resolver for *.${zone} already configured"
+            continue
+        fi
+        if [ "$sudo_prompted" = "0" ]; then
+            info "Configuring DNS resolvers (sudo) — may prompt for your Mac password"
+            sudo_prompted=1
+        fi
         if [ "$MCP_DRY_RUN" = "1" ]; then
-            echo "  [dry-run] sudo tee $resolver_file <<< 'nameserver ${MCP_DNS_NAMESERVER}'"
+            echo "  [dry-run] sudo tee $resolver_file <<< 'nameserver ${ns}'"
         else
             sudo mkdir -p /etc/resolver
-            echo "nameserver ${MCP_DNS_NAMESERVER}" | sudo tee "$resolver_file" >/dev/null
-            success "Wrote $resolver_file"
+            echo "nameserver ${ns}" | sudo tee "$resolver_file" >/dev/null
+            success "Wrote ${resolver_file} → ${ns}"
         fi
-    fi
+    done
 
     if dscacheutil -q host -a name "superset-mcp.${MCP_DNS_DOMAIN}" 2>/dev/null | grep -q "ip_address"; then
         success "VPN/DNS reachable"
@@ -748,7 +915,9 @@ fi
 
 echo ""
 if [ "$MCP_ONLY" = "0" ]; then
-    echo -e "  ${BOLD}To use Roman${NC}:  ${BOLD}cd ${ROMAN_DIR} && claude${NC}"
+    echo -e "  ${BOLD}To use Roman${NC}:  ${BOLD}cd ~/fido-money && claude${NC}"
     echo -e "  ${BOLD}To rerun MCP install later${NC}:  ${BOLD}bash <(curl -fsSL https://raw.githubusercontent.com/FidoMoney/fido-agent-installer/main/install.sh) --mcp-only${NC}"
     echo ""
 fi
+echo -e "${BOLD}${PINK}  🎉  All set — welcome to Fido!${NC}"
+echo ""
