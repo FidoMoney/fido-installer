@@ -456,11 +456,46 @@ fi  # end of `if [ "$MCP_ONLY" = "0" ]`
 MCP_DNS_DOMAIN="global-private.fido.money"
 MCP_DNS_NAMESERVER="10.3.0.2"
 
-MCP_CATALOG=(
-    argo-workflows argocd-nonprod argocd-prod atlassian aws clevertap
-    cloudflare datadog figma firebase freshdesk github google-ads k8s
-    mambu meta-ads mongodb slack snowflake superset watson
-)
+# Source of truth for the MCP catalog — derived at runtime from
+# https://github.com/FidoMoney/platform-team-gitops/tree/main/applications/mcp-servers
+# so adding a new MCP cluster-side automatically lights it up here on
+# the next install. Skips `mcp-shared-resources` (infra, not an MCP);
+# expands services with sub-overlays under overlays/global/ (e.g. argocd
+# → argocd-nonprod, argocd-prod) into one catalog entry per overlay.
+MCP_GITOPS_REPO="FidoMoney/platform-team-gitops"
+MCP_GITOPS_PATH="applications/mcp-servers"
+MCP_CATALOG=()
+
+build_mcp_catalog() {
+    local tree services service sub_overlays sub
+    tree=$(gh api "repos/${MCP_GITOPS_REPO}/git/trees/main?recursive=1" \
+        --jq '.tree[] | select(.type == "tree") | .path' 2>/dev/null) || return 1
+    [ -z "$tree" ] && return 1
+
+    services=$(echo "$tree" \
+        | grep -E "^${MCP_GITOPS_PATH}/[^/]+$" \
+        | sed "s|${MCP_GITOPS_PATH}/||" \
+        | grep -v '^mcp-shared-resources$' \
+        | sort -u || true)
+    [ -z "$services" ] && return 1
+
+    while IFS= read -r service; do
+        [ -z "$service" ] && continue
+        sub_overlays=$(echo "$tree" \
+            | grep -E "^${MCP_GITOPS_PATH}/${service}/overlays/global/[^/]+$" \
+            | sed "s|${MCP_GITOPS_PATH}/${service}/overlays/global/||" \
+            | sort -u || true)
+        if [ -n "$sub_overlays" ]; then
+            while IFS= read -r sub; do
+                [ -z "$sub" ] && continue
+                MCP_CATALOG+=("${service}-${sub}")
+            done <<< "$sub_overlays"
+        else
+            MCP_CATALOG+=("$service")
+        fi
+    done <<< "$services"
+    return 0
+}
 
 if [ "$SKIP_MCP" = "1" ]; then
     info "Skipping MCP install (--skip-mcp / SKIP_MCP_INSTALL=1)"
@@ -497,6 +532,29 @@ if ! command -v claude &> /dev/null; then
     fail "\`claude\` CLI not found on PATH. Open a new terminal and rerun."
     exit 1
 fi
+
+# Require gh CLI authenticated — needed to read the catalog from the
+# private platform-team-gitops repo. In full setup we already did this;
+# --mcp-only re-runs need it too.
+if ! command -v gh &> /dev/null; then
+    fail "\`gh\` CLI not found. Run the full installer first (without --mcp-only)."
+    exit 1
+fi
+if ! gh auth status &> /dev/null; then
+    fail "\`gh\` not authenticated. Run \`gh auth login\` then rerun."
+    exit 1
+fi
+
+# Build the catalog from gitops. Done before token prompt so a missing-
+# access failure errors out before the user goes hunting for their token.
+info "Reading MCP catalog from ${MCP_GITOPS_REPO}/${MCP_GITOPS_PATH}..."
+if ! build_mcp_catalog || [ "${#MCP_CATALOG[@]}" -eq 0 ]; then
+    fail "Could not read MCP catalog from ${MCP_GITOPS_REPO}."
+    fail "Check that your GitHub account has access to that repo."
+    exit 1
+fi
+success "Found ${BOLD}${#MCP_CATALOG[@]}${NC} MCP servers"
+echo ""
 
 # Token — flag / env / prompt.
 if [ -z "$MCP_TOKEN" ]; then
