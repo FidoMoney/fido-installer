@@ -1,0 +1,4 @@
+# This installer is executed verbatim by every new Fido employee on a fresh
+# machine. Any change here lands on developer laptops via curl|bash, so review
+# is restricted to the devops team.
+*       @FidoMoney/devops
