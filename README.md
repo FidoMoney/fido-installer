@@ -32,10 +32,11 @@ The script will walk you through:
 
 - Installing developer tools, AWS CLI, AWS VPN Client, and Claude Code
 - Importing your AWS VPN profile (paste it or point at a file — saved to `~/Documents/fido-vpn.ovpn`)
+- Writing the `/etc/resolver/*.fido.money` files (sudo) and launching AWS VPN Client to connect
 - Logging in to GitHub (`gh auth login` opens a browser)
-- Cloning `fido-agent` + every Roman repo into `~/fido-agent/`, plus a `~/fido-money` symlink as the entry point
-- Setting up Roman's `.claude/` config
-- Cloning the Fido `skills` repo (you pick where)
+- Cloning `fido-agent` + every agent repo into `~/fido-agent/`, plus a `~/fido-money` symlink as the entry point
+- Setting up the agents' `.claude/` config
+- Cloning the Fido `skills` repo — you pick where via an `fzf` picker
 - Picking which MCP servers to install — there's a one-tap "install all" option, otherwise multi-select with TAB
 - Pasting your MCP bearer token (input is hidden)
 

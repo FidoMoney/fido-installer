@@ -2,8 +2,8 @@
 #
 # Fido Agents Setup & Update Script
 # -----------------------------------
-# One-shot installer: dev tools, Claude Code, Fido repos, Roman, and all
-# cluster MCP servers. Idempotent — safe to rerun for updates.
+# One-shot installer: dev tools, Claude Code, Fido agents, AWS VPN, and
+# all cluster MCP servers. Idempotent — safe to rerun for updates.
 #
 # Quickstart (new employees):
 #   bash <(curl -fsSL https://raw.githubusercontent.com/FidoMoney/fido-agent-installer/main/install.sh)
@@ -49,6 +49,16 @@ done
 
 ORG="FidoMoney"
 
+# Internal DNS zones the VPN tunnel exposes. MCP servers live under
+# global-private.fido.money; private.fido.money serves the data backends
+# many MCPs talk to. Both resolvers must be in place for MCP installs to
+# verify reachability.
+MCP_DNS_DOMAIN="global-private.fido.money"
+MCP_DNS_ZONES=(
+    "global-private.fido.money:10.3.0.2"
+    "private.fido.money:10.30.0.2"
+)
+
 # Resolve install location. When invoked from a real file we co-locate
 # fido-agent/ next to the script (back-compat with the in-repo workflow).
 # When piped (`curl|bash`) or process-substituted (`bash <(curl ...)`),
@@ -78,6 +88,83 @@ info()    { echo -e "${BLUE}ℹ${NC}  $1"; }
 success() { echo -e "${GREEN}✔${NC}  $1"; }
 warn()    { echo -e "${YELLOW}⚠${NC}  $1"; }
 fail()    { echo -e "${RED}✖${NC}  $1"; }
+
+# Single-select picker via fzf. Echoes the chosen line, or empty on cancel.
+# Lines are passed as args. Caller decides how to interpret the result.
+fzf_pick() {
+    local prompt="$1"; shift
+    printf '%s\n' "$@" | fzf --height=40% --reverse --border --no-multi \
+        --prompt="${prompt} > " \
+        --header="↑↓ to move, Enter to select, Esc to cancel"
+}
+
+# Write the /etc/resolver/* files for every Fido internal zone. Idempotent:
+# skips zones whose resolver already points at the right nameserver, only
+# prompts for sudo if at least one zone needs writing.
+configure_dns_resolvers() {
+    [ "$MCP_SKIP_DNS" = "1" ] && { info "Skipping DNS resolver setup (--skip-dns)"; return 0; }
+    local zone_entry zone ns resolver_file sudo_prompted=0
+    for zone_entry in "${MCP_DNS_ZONES[@]}"; do
+        zone="${zone_entry%%:*}"
+        ns="${zone_entry##*:}"
+        resolver_file="/etc/resolver/${zone}"
+        if [ -f "$resolver_file" ] && grep -q "$ns" "$resolver_file"; then
+            success "DNS resolver for *.${zone} already configured"
+            continue
+        fi
+        if [ "$sudo_prompted" = "0" ]; then
+            info "Configuring DNS resolvers (sudo) — may prompt for your Mac password"
+            sudo_prompted=1
+        fi
+        if [ "$MCP_DRY_RUN" = "1" ]; then
+            echo "  [dry-run] sudo tee $resolver_file <<< 'nameserver ${ns}'"
+        else
+            sudo mkdir -p /etc/resolver
+            echo "nameserver ${ns}" | sudo tee "$resolver_file" >/dev/null
+            success "Wrote ${resolver_file} → ${ns}"
+        fi
+    done
+}
+
+# Returns 0 if DNS resolves an internal MCP host (i.e. VPN is up).
+vpn_is_up() {
+    dscacheutil -q host -a name "superset-mcp.${MCP_DNS_DOMAIN}" 2>/dev/null | grep -q "ip_address"
+}
+
+# Open AWS VPN Client and wait (up to ~60s) for connectivity. macOS doesn't
+# expose a CLI to connect a profile, so we open the GUI and poll DNS until
+# it resolves the internal MCP host. The user can press Enter at any time
+# to skip the wait.
+launch_vpn_and_wait() {
+    if vpn_is_up; then
+        success "VPN is already up"
+        return 0
+    fi
+    info "Launching ${BOLD}AWS VPN Client${NC}..."
+    open -a "AWS VPN Client" 2>/dev/null || warn "Couldn't open AWS VPN Client"
+    echo ""
+    if [ -n "${VPN_PROFILE_PATH:-}" ] && [ -f "$VPN_PROFILE_PATH" ]; then
+        info "If the profile isn't already loaded, add it now:"
+        info "  ${BOLD}File → Manage Profiles → Add Profile${NC}  →  ${VPN_PROFILE_PATH}"
+    fi
+    info "Click ${BOLD}Connect${NC} on the Fido profile in AWS VPN Client."
+    echo ""
+    info "Waiting for VPN to come up (up to 60s)... press ${BOLD}Enter${NC} to skip."
+    local i
+    for i in $(seq 1 30); do
+        if vpn_is_up; then
+            success "VPN is up — DNS resolves"
+            return 0
+        fi
+        # Non-blocking poll for Enter — 2s timeout per iteration.
+        if read -r -t 2 -n 1 _ 2>/dev/null; then
+            warn "Skipped VPN wait — continuing without verifying connectivity"
+            return 1
+        fi
+    done
+    warn "Timed out waiting for VPN — continuing anyway"
+    return 1
+}
 
 # Banner — slant-figlet "Fido Installer", Fido pink, with subtitle.
 print_banner() {
@@ -167,17 +254,17 @@ echo ""
 echo -e "${BOLD}── AWS VPN Client profile ──${NC}"
 echo ""
 info "AWS VPN Client needs a Fido profile (.ovpn file) to connect."
+VPN_PROFILE_DIR="${HOME}/Documents"
+VPN_PROFILE_PATH=""
+
 if [ -t 0 ]; then
-    echo -e "  ${BOLD}1)${NC} Paste config — I'll read until you press ${BOLD}Ctrl-D${NC}"
-    echo -e "  ${BOLD}2)${NC} Provide a path to a .ovpn file"
-    echo -e "  ${BOLD}s)${NC} Skip (set it up later in the AWS VPN Client UI)"
-    read -r -p "  > " vpn_choice
+    vpn_choice=$(fzf_pick "AWS VPN profile" \
+        "Paste config (.ovpn content) — read until Ctrl-D" \
+        "Provide a path to a .ovpn file" \
+        "Skip (set it up later in the AWS VPN Client UI)")
 
-    VPN_PROFILE_DIR="${HOME}/Documents"
-    VPN_PROFILE_PATH=""
-
-    case "${vpn_choice:-s}" in
-        1)
+    case "$vpn_choice" in
+        Paste*)
             echo ""
             info "Paste the full .ovpn content, then press ${BOLD}Ctrl-D${NC} on a blank line:"
             vpn_content="$(cat)"
@@ -190,7 +277,7 @@ if [ -t 0 ]; then
                 warn "Empty paste — skipping"
             fi
             ;;
-        2)
+        Provide*)
             read -r -p "  Path to .ovpn: " vpn_src
             vpn_src="${vpn_src/#\~/$HOME}"
             if [ -f "$vpn_src" ]; then
@@ -202,17 +289,26 @@ if [ -t 0 ]; then
                 warn "File not found: ${vpn_src} — skipping"
             fi
             ;;
-        s|S|*) info "Skipped — set up the profile later via AWS VPN Client → File → Manage Profiles → Add Profile" ;;
+        *) info "Skipped — set up the profile later via AWS VPN Client → File → Manage Profiles → Add Profile" ;;
     esac
 
     if [ -n "$VPN_PROFILE_PATH" ]; then
-        info "To finish: open ${BOLD}AWS VPN Client${NC}, then ${BOLD}File → Manage Profiles → Add Profile${NC}, and select:"
-        info "  ${BOLD}${VPN_PROFILE_PATH}${NC}"
-        info "Tip: ${BOLD}open -a 'AWS VPN Client'${NC} launches the app."
+        info "Profile saved at ${BOLD}${VPN_PROFILE_PATH}${NC} — I'll open AWS VPN Client next so you can add and connect it."
     fi
 else
     info "Non-interactive run — skipping VPN profile prompt"
 fi
+echo ""
+
+# ── DNS resolvers + VPN connect ─────────────────────────────────
+# Resolver files first (so internal hostnames route through the VPN
+# nameservers once the tunnel is up), then launch AWS VPN Client and
+# wait for connectivity.
+echo -e "${BOLD}── DNS resolvers + VPN connect ──${NC}"
+echo ""
+configure_dns_resolvers
+echo ""
+launch_vpn_and_wait
 echo ""
 
 # Claude Code — installed via the official installer (not brew)
@@ -287,7 +383,7 @@ if [ ! -d "$ROMAN_DIR" ]; then
     fail "Expected roman/ directory inside fido-agent but it doesn't exist"
     exit 1
 fi
-success "Roman folder ready: ${BOLD}${ROMAN_DIR}${NC}"
+success "Agents folder ready: ${BOLD}${ROMAN_DIR}${NC}"
 echo ""
 
 # ── Step 7: Load repo list from fido-agent ───────────────────────
@@ -437,7 +533,7 @@ done
 echo ""
 
 # ── Step 11: Set up Roman (Claude Code AI assistant) ─────────────
-echo -e "${BOLD}── Setting up Roman (AI assistant) ──${NC}"
+echo -e "${BOLD}── Setting up Agents (Claude Code workspace) ──${NC}"
 echo ""
 
 CLAUDE_DIR="${ROMAN_DIR}/.claude"
@@ -505,9 +601,9 @@ SETTINGS_EOF
         warn "CLAUDE.md not found in ${ROMAN_DIR}"
     fi
 
-    success "Roman is ready to use"
+    success "Agents are ready to use"
 else
-    warn "skills directory not found in fido-agent — Roman setup skipped"
+    warn "skills directory not found in fido-agent — Agents setup skipped"
 fi
 echo ""
 
@@ -531,19 +627,20 @@ info "FidoMoney/skills is a private repo of Claude Code skills curated by Fido."
 echo ""
 
 DEFAULT_SKILLS_DIR="${HOME}/.claude/skills/fido"
+COLOCATED_SKILLS_DIR="${HOME}/fido-money/skills-repo"
+
 if [ -t 0 ]; then
-    echo -e "  Where should it be cloned?"
-    echo -e "    ${BOLD}1)${NC} ${DEFAULT_SKILLS_DIR}  ${DIM}(user-scope, picked up by every Claude session)${NC}"
-    echo -e "    ${BOLD}2)${NC} ${HOME}/fido-money/skills-repo  ${DIM}(colocated with the install)${NC}"
-    echo -e "    ${BOLD}3)${NC} Custom path"
-    echo -e "    ${BOLD}s)${NC} Skip"
-    read -r -p "  > " skills_choice
-    case "${skills_choice:-1}" in
-        1|"") SKILLS_REPO_DIR="$DEFAULT_SKILLS_DIR" ;;
-        2)    SKILLS_REPO_DIR="${HOME}/fido-money/skills-repo" ;;
-        3)    read -r -p "  Path: " SKILLS_REPO_DIR ;;
-        s|S)  SKILLS_REPO_DIR="" ;;
-        *)    SKILLS_REPO_DIR="$DEFAULT_SKILLS_DIR" ;;
+    skills_choice=$(fzf_pick "Where to clone FidoMoney/skills" \
+        "${DEFAULT_SKILLS_DIR}  (user-scope, picked up by every Claude session)" \
+        "${COLOCATED_SKILLS_DIR}  (colocated with the install)" \
+        "Custom path" \
+        "Skip")
+    case "$skills_choice" in
+        "${DEFAULT_SKILLS_DIR}"*)   SKILLS_REPO_DIR="$DEFAULT_SKILLS_DIR" ;;
+        "${COLOCATED_SKILLS_DIR}"*) SKILLS_REPO_DIR="$COLOCATED_SKILLS_DIR" ;;
+        "Custom path")              read -r -p "  Path: " SKILLS_REPO_DIR ;;
+        "Skip"|"")                  SKILLS_REPO_DIR="" ;;
+        *)                          SKILLS_REPO_DIR="$DEFAULT_SKILLS_DIR" ;;
     esac
 else
     SKILLS_REPO_DIR="$DEFAULT_SKILLS_DIR"
@@ -579,7 +676,7 @@ success "Repos up to date:   ${UPDATED}"
 [ "$UPDATE_FAILED" -gt 0 ] && warn "Need attention:     ${UPDATE_FAILED}"
 [ "$CLONE_FAILED" -gt 0 ]  && warn "Clone failures:     ${CLONE_FAILED} (check access permissions)"
 echo ""
-success "Roman is at:       ${BOLD}${FIDO_MONEY_LINK}${NC}"
+success "Agents are at:     ${BOLD}${FIDO_MONEY_LINK}${NC}"
 [ -n "$SKILLS_REPO_DIR" ] && [ -d "$SKILLS_REPO_DIR" ] && success "Fido Skills:       ${BOLD}${SKILLS_REPO_DIR}${NC}"
 echo ""
 
@@ -589,8 +686,8 @@ fi  # end of `if [ "$MCP_ONLY" = "0" ]`
 #  MCP installer (inline)
 # ═════════════════════════════════════════════════════════════════
 
-MCP_DNS_DOMAIN="global-private.fido.money"
-MCP_DNS_NAMESERVER="10.3.0.2"
+# DNS constants live at the top of the script (used by both the early
+# VPN-connect step and the MCP installer below).
 
 # Source of truth for the MCP catalog — derived at runtime from
 # https://github.com/FidoMoney/platform-team-gitops/tree/main/applications/mcp-servers
@@ -637,7 +734,7 @@ if [ "$SKIP_MCP" = "1" ]; then
     info "Skipping MCP install (--skip-mcp / SKIP_MCP_INSTALL=1)"
     echo ""
     if [ "$MCP_ONLY" = "0" ]; then
-        echo -e "  ${BOLD}To use Roman${NC}:  ${BOLD}cd ~/fido-money && claude${NC}"
+        echo -e "  ${BOLD}To use agents${NC}:  ${BOLD}cd ~/fido-money && claude${NC}"
         echo ""
     fi
     exit 0
@@ -721,40 +818,12 @@ fi
 success "Token loaded (length=${#MCP_TOKEN})"
 echo ""
 
-# DNS resolver.
+# DNS resolvers — full setup already wrote these right after VPN install,
+# but call again here so --mcp-only re-runs on a fresh box still work.
+# configure_dns_resolvers is idempotent.
+configure_dns_resolvers
 if [ "$MCP_SKIP_DNS" = "0" ]; then
-    # All zones we need to resolve over the VPN. Each entry is "<zone>:<ns_ip>".
-    # MCP servers live under global-private.fido.money; private.fido.money is
-    # used by other Fido internal services (RDS, ElastiCache, etc.) and is
-    # needed for many of the MCPs to talk to their backing data sources.
-    MCP_DNS_ZONES=(
-        "global-private.fido.money:10.3.0.2"
-        "private.fido.money:10.30.0.2"
-    )
-
-    sudo_prompted=0
-    for zone_entry in "${MCP_DNS_ZONES[@]}"; do
-        zone="${zone_entry%%:*}"
-        ns="${zone_entry##*:}"
-        resolver_file="/etc/resolver/${zone}"
-        if [ -f "$resolver_file" ] && grep -q "$ns" "$resolver_file"; then
-            success "DNS resolver for *.${zone} already configured"
-            continue
-        fi
-        if [ "$sudo_prompted" = "0" ]; then
-            info "Configuring DNS resolvers (sudo) — may prompt for your Mac password"
-            sudo_prompted=1
-        fi
-        if [ "$MCP_DRY_RUN" = "1" ]; then
-            echo "  [dry-run] sudo tee $resolver_file <<< 'nameserver ${ns}'"
-        else
-            sudo mkdir -p /etc/resolver
-            echo "nameserver ${ns}" | sudo tee "$resolver_file" >/dev/null
-            success "Wrote ${resolver_file} → ${ns}"
-        fi
-    done
-
-    if dscacheutil -q host -a name "superset-mcp.${MCP_DNS_DOMAIN}" 2>/dev/null | grep -q "ip_address"; then
+    if vpn_is_up; then
         success "VPN/DNS reachable"
     else
         warn "Cannot resolve superset-mcp.${MCP_DNS_DOMAIN} — is the VPN on? Continuing anyway."
@@ -915,7 +984,7 @@ fi
 
 echo ""
 if [ "$MCP_ONLY" = "0" ]; then
-    echo -e "  ${BOLD}To use Roman${NC}:  ${BOLD}cd ~/fido-money && claude${NC}"
+    echo -e "  ${BOLD}To use agents${NC}:  ${BOLD}cd ~/fido-money && claude${NC}"
     echo -e "  ${BOLD}To rerun MCP install later${NC}:  ${BOLD}bash <(curl -fsSL https://raw.githubusercontent.com/FidoMoney/fido-agent-installer/main/install.sh) --mcp-only${NC}"
     echo ""
 fi
