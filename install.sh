@@ -14,10 +14,12 @@
 #   bash install.sh --token <TOKEN>       # supply MCP token up front
 #   bash install.sh --mcp-only --all      # all MCPs, no checklist
 #   bash install.sh --skip-mcp            # skip MCP step entirely
+#   bash install.sh --skip-repos          # skip cloning the per-team repos
 #
 # Environment:
 #   FIDO_MCP_TOKEN=<T>     same as --token
 #   SKIP_MCP_INSTALL=1     same as --skip-mcp
+#   SKIP_REPOS_INSTALL=1   same as --skip-repos
 #   FIDO_INSTALL_DIR=<D>   where to put fido-agent/  (default: $HOME when piped,
 #                          else the script's directory)
 #
@@ -27,6 +29,7 @@ set -euo pipefail
 # ── Arg parsing ──────────────────────────────────────────────────
 MCP_ONLY=0
 SKIP_MCP="${SKIP_MCP_INSTALL:-0}"
+SKIP_REPOS="${SKIP_REPOS_INSTALL:-0}"
 MCP_TOKEN="${FIDO_MCP_TOKEN:-}"
 MCP_MODE="interactive"
 MCP_ONLY_LIST=""
@@ -35,15 +38,16 @@ MCP_SKIP_DNS=0
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --mcp-only)  MCP_ONLY=1; shift ;;
-        --skip-mcp)  SKIP_MCP=1; shift ;;
-        --token)     MCP_TOKEN="$2"; shift 2 ;;
-        --all)       MCP_MODE="all"; shift ;;
-        --only)      MCP_MODE="only"; MCP_ONLY_LIST="${2:-}"; shift 2 ;;
-        --dry-run)   MCP_DRY_RUN=1; shift ;;
-        --skip-dns)  MCP_SKIP_DNS=1; shift ;;
-        -h|--help)   sed -n '2,22p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
-        *)           echo "Unknown flag: $1" >&2; exit 2 ;;
+        --mcp-only)   MCP_ONLY=1; shift ;;
+        --skip-mcp)   SKIP_MCP=1; shift ;;
+        --skip-repos) SKIP_REPOS=1; shift ;;
+        --token)      MCP_TOKEN="$2"; shift 2 ;;
+        --all)        MCP_MODE="all"; shift ;;
+        --only)       MCP_MODE="only"; MCP_ONLY_LIST="${2:-}"; shift 2 ;;
+        --dry-run)    MCP_DRY_RUN=1; shift ;;
+        --skip-dns)   MCP_SKIP_DNS=1; shift ;;
+        -h|--help)    sed -n '2,24p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        *)            echo "Unknown flag: $1" >&2; exit 2 ;;
     esac
 done
 
@@ -500,6 +504,31 @@ fi
 success "Agents folder ready: ${BOLD}${ROMAN_DIR}${NC}"
 echo ""
 
+# ── Optional: clone the per-team repos into roman/ ──────────────
+# Mirror the MCP step: ask up front so the user can opt out of the
+# (slow) clone-everything pass. --skip-repos / SKIP_REPOS_INSTALL=1
+# bypasses the prompt non-interactively.
+echo -e "${BOLD}── Per-team repositories ──${NC}"
+echo ""
+info "The installer can clone every Fido team repo (listed in roman-repos.txt)"
+info "into ${BOLD}${ROMAN_DIR}${NC} so Claude can browse them locally. This can take a while."
+echo ""
+
+if [ "$SKIP_REPOS" = "1" ]; then
+    info "Skipping repo clone (--skip-repos / SKIP_REPOS_INSTALL=1)"
+    echo ""
+elif [ -t 0 ]; then
+    read -r -p "$(echo -e "  Clone the per-team repositories now? [Y/n] ")" reply
+    case "${reply:-Y}" in
+        n|N|no|NO) SKIP_REPOS=1
+                   info "Skipped — rerun later without --skip-repos to clone them."
+                   echo "" ;;
+        *) ;;
+    esac
+fi
+
+if [ "$SKIP_REPOS" = "0" ]; then
+
 # ── Step 7: Load repo list from fido-agent ───────────────────────
 #
 # The list of repos to clone into roman/ lives inside the (private)
@@ -646,6 +675,8 @@ done
 
 echo ""
 
+fi  # end of `if [ "$SKIP_REPOS" = "0" ]`
+
 # ── Step 11: Set up Roman (Claude Code AI assistant) ─────────────
 echo -e "${BOLD}── Setting up Agents (Claude Code workspace) ──${NC}"
 echo ""
@@ -785,10 +816,14 @@ echo -e "${BOLD}═════════════════════�
 echo -e "${BOLD}   Setup Complete${NC}"
 echo -e "${BOLD}══════════════════════════════════════════════════${NC}"
 echo ""
-[ "$CLONED" -gt 0 ]       && success "New repos cloned:   ${CLONED}"
-success "Repos up to date:   ${UPDATED}"
-[ "$UPDATE_FAILED" -gt 0 ] && warn "Need attention:     ${UPDATE_FAILED}"
-[ "$CLONE_FAILED" -gt 0 ]  && warn "Clone failures:     ${CLONE_FAILED} (check access permissions)"
+if [ "$SKIP_REPOS" = "1" ]; then
+    info "Per-team repos: skipped"
+else
+    [ "$CLONED" -gt 0 ]       && success "New repos cloned:   ${CLONED}"
+    success "Repos up to date:   ${UPDATED}"
+    [ "$UPDATE_FAILED" -gt 0 ] && warn "Need attention:     ${UPDATE_FAILED}"
+    [ "$CLONE_FAILED" -gt 0 ]  && warn "Clone failures:     ${CLONE_FAILED} (check access permissions)"
+fi
 echo ""
 success "Agents are at:     ${BOLD}${FIDO_MONEY_LINK}${NC}"
 [ -n "$SKILLS_REPO_DIR" ] && [ -d "$SKILLS_REPO_DIR" ] && success "Fido Skills:       ${BOLD}${SKILLS_REPO_DIR}${NC}"
