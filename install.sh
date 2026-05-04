@@ -246,18 +246,107 @@ install_brew_pkg aws awscli  "AWS CLI"
 # steps (VPN profile, MCP token retrieval, infra access) assume an AWS
 # user is reachable; surfacing this here gives a clear error instead
 # of cryptic failures later.
-if aws_caller_output=$(aws sts get-caller-identity 2>&1); then
-    aws_identity=$(echo "$aws_caller_output" | awk -F'"' '/Arn/ {print $4}')
-    success "AWS credentials valid (${BOLD}${aws_identity:-unknown}${NC})"
-else
+#
+# Profile names differ per user (e.g. `fido`, `dev`, `john-sso`). SSO
+# users commonly have a named profile but no AWS_PROFILE set in their
+# shell, so the bare `sts` call hits the empty `default` profile and
+# fails. We discover whatever profiles exist on this machine: try the
+# default, then scan ~/.aws/config and try each named profile, then
+# offer `aws sso login` for SSO profiles when nothing has a live session.
+
+list_aws_profiles() {
+    local cfg="${AWS_CONFIG_FILE:-${HOME}/.aws/config}"
+    [ -f "$cfg" ] || return 0
+    grep -E '^\[(profile [^]]+|default)\]' "$cfg" \
+        | sed -E 's/^\[(profile )?([^]]+)\]/\2/'
+}
+
+profile_is_sso() {
+    local prof="$1" cfg="${AWS_CONFIG_FILE:-${HOME}/.aws/config}"
+    [ -f "$cfg" ] || return 1
+    awk -v target="$prof" '
+        /^\[(profile [^]]+|default)\]/ {
+            name = $0
+            sub(/^\[(profile )?/, "", name); sub(/\]$/, "", name)
+            in_section = (name == target)
+            next
+        }
+        /^\[/ { in_section = 0; next }
+        in_section && /^[[:space:]]*sso_(start_url|session)[[:space:]]*=/ { found = 1 }
+        END { exit !found }
+    ' "$cfg"
+}
+
+verify_aws_creds() {
+    local out arn p
+    if out=$(aws sts get-caller-identity 2>&1); then
+        arn=$(echo "$out" | awk -F'"' '/Arn/ {print $4}')
+        success "AWS credentials valid (${BOLD}${arn:-unknown}${NC})"
+        return 0
+    fi
+    aws_caller_output="$out"
+
+    local profiles
+    profiles=$(list_aws_profiles | awk '!seen[$0]++' || true)
+    [ -z "$profiles" ] && return 1
+
+    while IFS= read -r p; do
+        [ -z "$p" ] && continue
+        if out=$(aws sts get-caller-identity --profile "$p" 2>&1); then
+            arn=$(echo "$out" | awk -F'"' '/Arn/ {print $4}')
+            export AWS_PROFILE="$p"
+            success "AWS credentials valid via profile ${BOLD}${p}${NC} (${arn:-unknown})"
+            info "Using ${BOLD}AWS_PROFILE=${p}${NC} for this installer run."
+            info "To make it permanent, add ${BOLD}export AWS_PROFILE=${p}${NC} to your shell rc."
+            return 0
+        fi
+    done <<< "$profiles"
+
+    local -a sso_profiles=()
+    while IFS= read -r p; do
+        [ -z "$p" ] && continue
+        profile_is_sso "$p" && sso_profiles+=("$p")
+    done <<< "$profiles"
+
+    [ "${#sso_profiles[@]}" -eq 0 ] && return 1
+    [ -t 0 ] || return 1
+
+    local chosen
+    if [ "${#sso_profiles[@]}" -eq 1 ]; then
+        chosen="${sso_profiles[0]}"
+        info "Found SSO profile ${BOLD}${chosen}${NC} — running ${BOLD}aws sso login${NC}..."
+    else
+        chosen=$(fzf_pick "Pick AWS SSO profile to log in" "${sso_profiles[@]}")
+        [ -z "$chosen" ] && return 1
+    fi
+
+    if aws sso login --profile "$chosen"; then
+        if out=$(aws sts get-caller-identity --profile "$chosen" 2>&1); then
+            arn=$(echo "$out" | awk -F'"' '/Arn/ {print $4}')
+            export AWS_PROFILE="$chosen"
+            success "AWS credentials valid via profile ${BOLD}${chosen}${NC} (${arn:-unknown})"
+            info "Using ${BOLD}AWS_PROFILE=${chosen}${NC} for this installer run."
+            info "To make it permanent, add ${BOLD}export AWS_PROFILE=${chosen}${NC} to your shell rc."
+            return 0
+        fi
+        aws_caller_output="$out"
+    fi
+    return 1
+}
+
+if ! verify_aws_creds; then
     echo ""
     fail "AWS credentials are not configured or are invalid."
-    fail "Details: ${aws_caller_output}"
+    fail "Details: ${aws_caller_output:-Unable to locate credentials}"
     echo ""
     info "Set them up with one of:"
-    info "  ${BOLD}aws configure${NC}                 (long-lived access keys)"
     info "  ${BOLD}aws configure sso${NC}             (recommended — IAM Identity Center)"
+    info "  ${BOLD}aws configure${NC}                 (long-lived access keys)"
     info "  export ${BOLD}AWS_ACCESS_KEY_ID${NC} / ${BOLD}AWS_SECRET_ACCESS_KEY${NC} / ${BOLD}AWS_SESSION_TOKEN${NC}"
+    echo ""
+    info "Already ran ${BOLD}aws configure sso${NC}? Your profile may not be the default."
+    info "Try ${BOLD}export AWS_PROFILE=<your-profile-name>${NC} before rerunning,"
+    info "or ${BOLD}aws sso login --profile <your-profile-name>${NC} to refresh the session."
     echo ""
     fail "Aborting installer — rerun once an AWS user is configured."
     exit 1
