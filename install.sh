@@ -57,6 +57,9 @@ MCP_DNS_DOMAIN="global-private.fido.money"
 MCP_DNS_ZONES=(
     "global-private.fido.money:10.3.0.2"
     "private.fido.money:10.30.0.2"
+    "gh-prod-private.fido.money:10.20.0.2"
+    "ug-prod-private.fido.money:10.40.0.2"
+    "zm-prod-private.fido.money:10.50.0.2"
 )
 
 # Resolve install location. When invoked from a real file we co-locate
@@ -237,6 +240,28 @@ install_brew_pkg() {
 install_brew_pkg gh  gh      "GitHub CLI"
 install_brew_pkg fzf fzf     "fzf (nice multi-select UI)"
 install_brew_pkg aws awscli  "AWS CLI"
+
+# ── Verify AWS credentials are configured ───────────────────────
+# Fail fast if the user has no working AWS identity. Many downstream
+# steps (VPN profile, MCP token retrieval, infra access) assume an AWS
+# user is reachable; surfacing this here gives a clear error instead
+# of cryptic failures later.
+if aws_caller_output=$(aws sts get-caller-identity 2>&1); then
+    aws_identity=$(echo "$aws_caller_output" | awk -F'"' '/Arn/ {print $4}')
+    success "AWS credentials valid (${BOLD}${aws_identity:-unknown}${NC})"
+else
+    echo ""
+    fail "AWS credentials are not configured or are invalid."
+    fail "Details: ${aws_caller_output}"
+    echo ""
+    info "Set them up with one of:"
+    info "  ${BOLD}aws configure${NC}                 (long-lived access keys)"
+    info "  ${BOLD}aws configure sso${NC}             (recommended — IAM Identity Center)"
+    info "  export ${BOLD}AWS_ACCESS_KEY_ID${NC} / ${BOLD}AWS_SECRET_ACCESS_KEY${NC} / ${BOLD}AWS_SESSION_TOKEN${NC}"
+    echo ""
+    fail "Aborting installer — rerun once an AWS user is configured."
+    exit 1
+fi
 
 # AWS VPN Client — installed as a Homebrew cask (handles arch under the hood).
 if brew list --cask aws-vpn-client &> /dev/null; then
