@@ -6,7 +6,7 @@
 # all cluster MCP servers. Idempotent — safe to rerun for updates.
 #
 # Quickstart (new employees):
-#   bash <(curl -fsSL https://raw.githubusercontent.com/FidoMoney/fido-agent-installer/main/install.sh)
+#   bash <(curl -fsSL https://raw.githubusercontent.com/FidoMoney/fido-installer/main/install.sh)
 #
 # Usage (when run from a downloaded copy):
 #   bash install.sh                       # full setup (interactive)
@@ -588,7 +588,7 @@ else
     else
         warn "Non-interactive run — skipping VPN profile prompt."
         info "To set it up later, re-run interactively, or run:"
-        info "  ${BOLD}bash <(curl -fsSL https://raw.githubusercontent.com/FidoMoney/fido-agent-installer/main/install.sh)${NC}"
+        info "  ${BOLD}bash <(curl -fsSL https://raw.githubusercontent.com/FidoMoney/fido-installer/main/install.sh)${NC}"
         info "Or import the .ovpn manually via AWS VPN Client → File → Manage Profiles → Add Profile."
     fi
 fi
@@ -1072,7 +1072,7 @@ if [ "$MCP_ONLY" = "0" ] && [ -t 0 ]; then
     read -r -p "$(echo -e "  Install MCP servers now? [Y/n] ")" reply
     case "${reply:-Y}" in
         y|Y|yes|YES) ;;
-        *) info "Skipped. Run later:  ${BOLD}bash <(curl -fsSL https://raw.githubusercontent.com/FidoMoney/fido-agent-installer/main/install.sh) --mcp-only${NC}"; echo ""; exit 0 ;;
+        *) info "Skipped. Run later:  ${BOLD}bash <(curl -fsSL https://raw.githubusercontent.com/FidoMoney/fido-installer/main/install.sh) --mcp-only${NC}"; echo ""; exit 0 ;;
     esac
 fi
 
@@ -1306,7 +1306,7 @@ fi
 echo ""
 if [ "$MCP_ONLY" = "0" ]; then
     echo -e "  ${BOLD}To use agents${NC}:  ${BOLD}cd ~/fido-money && claude${NC}"
-    echo -e "  ${BOLD}To rerun MCP install later${NC}:  ${BOLD}bash <(curl -fsSL https://raw.githubusercontent.com/FidoMoney/fido-agent-installer/main/install.sh) --mcp-only${NC}"
+    echo -e "  ${BOLD}To rerun MCP install later${NC}:  ${BOLD}bash <(curl -fsSL https://raw.githubusercontent.com/FidoMoney/fido-installer/main/install.sh) --mcp-only${NC}"
     echo ""
 fi
 echo -e "${BOLD}${PINK}  🎉  All set — welcome to Fido!${NC}"

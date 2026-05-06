@@ -6,7 +6,7 @@
   all cluster MCP servers. Idempotent — safe to rerun for updates.
 
   Quickstart (new employees):
-    iex (irm https://raw.githubusercontent.com/FidoMoney/fido-agent-installer/main/install.ps1)
+    iex (irm https://raw.githubusercontent.com/FidoMoney/fido-installer/main/install.ps1)
 
   Usage (when run from a downloaded copy):
     powershell -ExecutionPolicy Bypass -File .\install.ps1                 # full setup
@@ -635,7 +635,7 @@ if (-not $McpOnly) {
         } else {
             Write-Warn2 "Non-interactive run — skipping VPN profile prompt."
             Write-Info "To set it up later, re-run interactively, or run:"
-            Write-Info "  iex (irm https://raw.githubusercontent.com/FidoMoney/fido-agent-installer/main/install.ps1)"
+            Write-Info "  iex (irm https://raw.githubusercontent.com/FidoMoney/fido-installer/main/install.ps1)"
             Write-Info "Or import the .ovpn manually via AWS VPN Client -> File -> Manage Profiles -> Add Profile."
         }
     }
