@@ -147,7 +147,8 @@ launch_vpn_and_wait() {
     info "Launching ${BOLD}AWS VPN Client${NC}..."
     open -a "AWS VPN Client" 2>/dev/null || warn "Couldn't open AWS VPN Client"
     echo ""
-    if [ -n "${VPN_PROFILE_PATH:-}" ] && [ -f "$VPN_PROFILE_PATH" ]; then
+    if [ "${VPN_PROFILE_AUTO_IMPORTED:-0}" != "1" ] \
+        && [ -n "${VPN_PROFILE_PATH:-}" ] && [ -f "$VPN_PROFILE_PATH" ]; then
         info "If the profile isn't already loaded, add it now:"
         info "  ${BOLD}File → Manage Profiles → Add Profile${NC}  →  ${VPN_PROFILE_PATH}"
     fi
@@ -190,6 +191,28 @@ else
     echo -e "${BOLD}   Setup & update${NC}"
 fi
 echo ""
+
+# Upfront preamble — what's about to happen, and what touches the system,
+# so the user has a chance to bail before sudo/network calls. Skipped in
+# --mcp-only mode (smaller scope) and in non-interactive runs.
+if [ "$MCP_ONLY" = "0" ] && [ -t 0 ]; then
+    echo -e "${BOLD}This installer will:${NC}"
+    echo "  • Install Homebrew packages: gh, fzf, awscli, AWS VPN Client (cask)"
+    echo "  • Install Claude Code (via the official installer at claude.ai/install.sh)"
+    echo "  • Verify AWS credentials, or walk you through ${BOLD}aws configure sso${NC} on first run"
+    echo "  • Clone/update Fido repos under ${BOLD}${SCRIPT_DIR}/fido-agent/${NC}"
+    echo "  • Configure macOS DNS resolvers under ${BOLD}/etc/resolver/${NC} (asks for sudo)"
+    echo "  • Import a Fido VPN profile into ${BOLD}~/.config/AWSVPNClient/${NC}"
+    echo "  • Register Fido cluster MCP servers with Claude Code (user scope)"
+    echo ""
+    echo -e "  ${BOLD}Will read/write${NC}: ~/.aws  ~/.config/AWSVPNClient  ~/.claude  /etc/resolver/"
+    echo -e "  ${BOLD}Network access${NC}: Homebrew, GitHub, AWS SSO browser, MCP hosts (via VPN)"
+    echo ""
+    echo "  Re-running is safe — every step is idempotent."
+    echo ""
+    read -r -p "$(echo -e "${BOLD}Press Enter to continue, or Ctrl-C to abort: ${NC}")" _
+    echo ""
+fi
 
 # Initialize counters so they're safe when --mcp-only skips the repo section.
 CLONED=0; SKIPPED=0; CLONE_FAILED=0; UPDATED=0; UPDATE_FAILED=0
@@ -256,10 +279,7 @@ install_brew_pkg aws awscli  "AWS CLI"
 # offer `aws sso login` for SSO profiles when nothing has a live session.
 
 list_aws_profiles() {
-    local cfg="${AWS_CONFIG_FILE:-${HOME}/.aws/config}"
-    [ -f "$cfg" ] || return 0
-    grep -E '^\[(profile [^]]+|default)\]' "$cfg" \
-        | sed -E 's/^\[(profile )?([^]]+)\]/\2/'
+    aws configure list-profiles 2>/dev/null || true
 }
 
 profile_is_sso() {
@@ -280,7 +300,7 @@ profile_is_sso() {
 
 verify_aws_creds() {
     local out arn p
-    if out=$(aws sts get-caller-identity 2>&1); then
+    if out=$(aws sts get-caller-identity --output json 2>&1); then
         arn=$(echo "$out" | awk -F'"' '/Arn/ {print $4}')
         success "AWS credentials valid (${BOLD}${arn:-unknown}${NC})"
         return 0
@@ -293,7 +313,7 @@ verify_aws_creds() {
 
     while IFS= read -r p; do
         [ -z "$p" ] && continue
-        if out=$(aws sts get-caller-identity --profile "$p" 2>&1); then
+        if out=$(aws sts get-caller-identity --profile "$p" --output json 2>&1); then
             arn=$(echo "$out" | awk -F'"' '/Arn/ {print $4}')
             export AWS_PROFILE="$p"
             success "AWS credentials valid via profile ${BOLD}${p}${NC} (${arn:-unknown})"
@@ -322,7 +342,7 @@ verify_aws_creds() {
     fi
 
     if aws sso login --profile "$chosen"; then
-        if out=$(aws sts get-caller-identity --profile "$chosen" 2>&1); then
+        if out=$(aws sts get-caller-identity --profile "$chosen" --output json 2>&1); then
             arn=$(echo "$out" | awk -F'"' '/Arn/ {print $4}')
             export AWS_PROFILE="$chosen"
             success "AWS credentials valid via profile ${BOLD}${chosen}${NC} (${arn:-unknown})"
@@ -335,26 +355,161 @@ verify_aws_creds() {
     return 1
 }
 
-if ! verify_aws_creds; then
+# First-time SSO setup: walk a brand-new user through `aws configure sso`
+# with the Fido start URL/region. Only invoked when verify_aws_creds has
+# already failed (no working profile). Returns 0 if bootstrap produced a
+# working profile, 1 otherwise.
+FIDO_SSO_START_URL="https://fido.awsapps.com/start/"
+FIDO_SSO_REGION="eu-west-1"
+
+bootstrap_aws_sso() {
+    [ -t 0 ] || return 1
+
     echo ""
-    fail "AWS credentials are not configured or are invalid."
-    fail "Details: ${aws_caller_output:-Unable to locate credentials}"
+    echo -e "${BOLD}── First-time AWS SSO setup ──${NC}"
     echo ""
-    info "Set them up with one of:"
-    info "  ${BOLD}aws configure sso${NC}             (recommended — IAM Identity Center)"
-    info "  ${BOLD}aws configure${NC}                 (long-lived access keys)"
-    info "  export ${BOLD}AWS_ACCESS_KEY_ID${NC} / ${BOLD}AWS_SECRET_ACCESS_KEY${NC} / ${BOLD}AWS_SESSION_TOKEN${NC}"
+    info "No working AWS credentials found. Let's set up Fido AWS SSO."
+    info "I'll run ${BOLD}aws configure sso${NC} — when prompted, enter these values:"
     echo ""
-    info "Already ran ${BOLD}aws configure sso${NC}? Your profile may not be the default."
-    info "Try ${BOLD}export AWS_PROFILE=<your-profile-name>${NC} before rerunning,"
-    info "or ${BOLD}aws sso login --profile <your-profile-name>${NC} to refresh the session."
+    info "  SSO session name:        ${BOLD}fido${NC}"
+    info "  SSO start URL:           ${BOLD}${FIDO_SSO_START_URL}${NC}"
+    info "  SSO region:              ${BOLD}${FIDO_SSO_REGION}${NC}"
+    info "  SSO registration scopes: ${BOLD}sso:account:access${NC} (or press Enter)"
     echo ""
-    fail "Aborting installer — rerun once an AWS user is configured."
+    info "A browser will open for you to authenticate to Fido SSO."
+    info "After login you'll pick your account and role from a list."
+    echo ""
+    info "Final prompts:"
+    info "  CLI default Region:  ${BOLD}${FIDO_SSO_REGION}${NC}"
+    info "  CLI default output:  ${BOLD}json${NC}"
+    info "  CLI profile name:    ${BOLD}fido${NC} (any name works)"
+    echo ""
+    read -r -p "$(echo -e "${BOLD}Press Enter to start, or Ctrl-C to abort: ${NC}")" _
+    echo ""
+
+    if aws configure sso; then
+        echo ""
+        success "${BOLD}aws configure sso${NC} completed."
+        verify_aws_creds && return 0
+        warn "Setup finished but credentials still don't validate — see message below."
+    fi
+    return 1
+}
+
+if ! verify_aws_creds && ! bootstrap_aws_sso; then
+    echo ""
+    fail "Couldn't establish working AWS credentials."
+    [ -n "${aws_caller_output:-}" ] && fail "Details: ${aws_caller_output}"
+    echo ""
+    info "${BOLD}Don't have a Fido AWS account yet?${NC}"
+    info "  Ping ${BOLD}#eng-platform${NC} on Slack to request one."
+    info "  Once it's created, re-run this installer."
+    echo ""
+    info "${BOLD}SSO login failed (browser/auth error)?${NC}"
+    info "  Re-run ${BOLD}aws configure sso${NC} manually, then re-run this installer."
+    echo ""
+    info "${BOLD}Already configured under a different profile?${NC}"
+    info "  Run ${BOLD}export AWS_PROFILE=<your-profile-name>${NC} before rerunning,"
+    info "  or ${BOLD}aws sso login --profile <your-profile-name>${NC} to refresh."
+    echo ""
+    fail "Aborting installer — re-run once AWS access is set up."
     exit 1
 fi
 
-# AWS VPN Client — installed as a Homebrew cask (handles arch under the hood).
-if brew list --cask aws-vpn-client &> /dev/null; then
+# AWS VPN Client — installed as a Homebrew cask, OR detected via /Applications
+# (covers users who installed from the DMG / by hand instead of brew).
+vpn_app_installed() {
+    [ -d "/Applications/AWS VPN Client/AWS VPN Client.app" ] \
+        || [ -d "/Applications/AWS VPN Client.app" ] \
+        || brew list --cask aws-vpn-client &> /dev/null
+}
+
+# Detect "AWS VPN Client already has at least one profile imported".
+# Profiles are tracked in ~/.config/AWSVPNClient/ConnectionProfiles (JSON);
+# the per-profile OpenVPN config is under .../OpenVpnConfigs/<name>.
+vpn_has_profile() {
+    local f="${HOME}/.config/AWSVPNClient/ConnectionProfiles"
+    [ -f "$f" ] && grep -q '"ProfileName"' "$f" 2>/dev/null
+}
+
+# Auto-import a Fido VPN .ovpn straight into AWS VPN Client's registry so
+# the user doesn't have to do "File → Manage Profiles → Add Profile" by
+# hand. Parses the AWS Client VPN endpoint host out of the `remote` line,
+# drops the file at ~/.config/AWSVPNClient/OpenVpnConfigs/<name> (no
+# extension — that's how AWS VPN Client stores them), and merges a new
+# entry into ConnectionProfiles JSON. Idempotent: returns success if a
+# profile of the same name is already registered.
+# Returns 0 on success, 1 on parse/IO failure (caller should fall back
+# to the manual GUI-import path).
+import_vpn_profile() {
+    local src="$1" name="${2:-Fido VPN}"
+    local cfg_dir="${HOME}/.config/AWSVPNClient"
+    local registry="$cfg_dir/ConnectionProfiles"
+    local ovpn_dir="$cfg_dir/OpenVpnConfigs"
+
+    [ -f "$src" ] || return 1
+    command -v python3 >/dev/null 2>&1 || return 1
+
+    # Find the AWS Client VPN endpoint hostname anywhere on a `remote` line
+    # (covers commercial, GovCloud, and amazonaws.com.cn endpoints — and
+    # any future `<random>.cvpn-endpoint-...` host shape).
+    local remote_line endpoint region auth_type
+    remote_line=$(grep -E '^[[:space:]]*remote[[:space:]]+\S*cvpn-endpoint-[a-z0-9]+\.\S*clientvpn\.[a-z0-9-]+\.amazonaws\.com(\.cn)?' "$src" | head -1 || true)
+    [ -z "$remote_line" ] && return 1
+    endpoint=$(echo "$remote_line" | grep -oE 'cvpn-endpoint-[a-z0-9]+' | head -1)
+    region=$(echo   "$remote_line" | sed -E 's/.*\.clientvpn\.([a-z0-9-]+)\.amazonaws\.com.*/\1/')
+    [ -n "$endpoint" ] || return 1
+
+    # FederatedAuthType: 1 = SAML federated SSO, 0 = mutual cert auth.
+    # Detect by looking for `auth-federate` directive (federated) or an
+    # inline <cert>/<key> block / `auth-user-pass` (mutual). Default 1
+    # because Fido uses SAML SSO.
+    if grep -qE '^[[:space:]]*auth-federate' "$src"; then
+        auth_type=1
+    elif grep -qE '^[[:space:]]*<cert>|^[[:space:]]*auth-user-pass' "$src"; then
+        auth_type=0
+    else
+        auth_type=1
+    fi
+
+    mkdir -p "$ovpn_dir"
+    [ -f "$registry" ] || echo '{"Version":"1","LastSelectedProfileIndex":-1,"ConnectionProfiles":[]}' > "$registry"
+
+    # Idempotency check — pass name via argv to avoid shell-injection
+    # via a profile name containing quotes/$.
+    if python3 - "$registry" "$name" <<'PY' 2>/dev/null
+import json, sys
+registry, name = sys.argv[1:3]
+d = json.load(open(registry))
+sys.exit(0 if any(p.get('ProfileName') == name for p in d.get('ConnectionProfiles', [])) else 1)
+PY
+    then
+        return 0  # already registered — nothing to do
+    fi
+
+    local ovpn_dest="$ovpn_dir/$name"
+    cp "$src" "$ovpn_dest" || return 1
+
+    python3 - "$registry" "$name" "$ovpn_dest" "$endpoint" "$region" "$auth_type" <<'PY' || return 1
+import json, os, sys, tempfile
+registry, name, path, endpoint, region, auth_type = sys.argv[1:7]
+with open(registry) as f: d = json.load(f)
+d.setdefault('Version', '1'); d.setdefault('LastSelectedProfileIndex', -1)
+d.setdefault('ConnectionProfiles', []).append({
+    'ProfileName': name,
+    'OvpnConfigFilePath': path,
+    'CvpnEndpointId': endpoint,
+    'CvpnEndpointRegion': region,
+    'CompatibilityVersion': '2',
+    'FederatedAuthType': int(auth_type),
+})
+fd, tmp = tempfile.mkstemp(prefix='.cp.', dir=os.path.dirname(registry))
+with os.fdopen(fd, 'w') as f: json.dump(d, f)
+os.replace(tmp, registry)
+PY
+}
+
+if vpn_app_installed; then
     success "AWS VPN Client is installed"
 else
     info "Installing AWS VPN Client (cask — may prompt for your Mac password)..."
@@ -365,53 +520,77 @@ fi
 # AWS VPN Client profile — let the user paste the .ovpn or point at a file.
 # Saved to ~/Documents/fido-vpn.ovpn so the user can import it via the
 # AWS VPN Client GUI (it has no CLI for profile add on macOS).
+# Skip the whole prompt if a profile is already imported — the user is
+# returning to update; nothing to do here.
 echo ""
-echo -e "${BOLD}── AWS VPN Client profile ──${NC}"
-echo ""
-info "AWS VPN Client needs a Fido profile (.ovpn file) to connect."
 VPN_PROFILE_DIR="${HOME}/Documents"
 VPN_PROFILE_PATH=""
 
-if [ -t 0 ]; then
-    vpn_choice=$(fzf_pick "AWS VPN profile" \
-        "Paste config (.ovpn content) — read until Ctrl-D" \
-        "Provide a path to a .ovpn file" \
-        "Skip (set it up later in the AWS VPN Client UI)")
-
-    case "$vpn_choice" in
-        Paste*)
-            echo ""
-            info "Paste the full .ovpn content, then press ${BOLD}Ctrl-D${NC} on a blank line:"
-            vpn_content="$(cat)"
-            if [ -n "$vpn_content" ]; then
-                mkdir -p "$VPN_PROFILE_DIR"
-                VPN_PROFILE_PATH="${VPN_PROFILE_DIR}/fido-vpn.ovpn"
-                printf '%s\n' "$vpn_content" > "$VPN_PROFILE_PATH"
-                success "Saved VPN config to ${BOLD}${VPN_PROFILE_PATH}${NC}"
-            else
-                warn "Empty paste — skipping"
-            fi
-            ;;
-        Provide*)
-            read -r -p "  Path to .ovpn: " vpn_src
-            vpn_src="${vpn_src/#\~/$HOME}"
-            if [ -f "$vpn_src" ]; then
-                mkdir -p "$VPN_PROFILE_DIR"
-                VPN_PROFILE_PATH="${VPN_PROFILE_DIR}/fido-vpn.ovpn"
-                cp "$vpn_src" "$VPN_PROFILE_PATH"
-                success "Copied VPN config to ${BOLD}${VPN_PROFILE_PATH}${NC}"
-            else
-                warn "File not found: ${vpn_src} — skipping"
-            fi
-            ;;
-        *) info "Skipped — set up the profile later via AWS VPN Client → File → Manage Profiles → Add Profile" ;;
-    esac
-
-    if [ -n "$VPN_PROFILE_PATH" ]; then
-        info "Profile saved at ${BOLD}${VPN_PROFILE_PATH}${NC} — I'll open AWS VPN Client next so you can add and connect it."
-    fi
+if vpn_has_profile; then
+    success "AWS VPN Client already has a profile configured — skipping setup"
 else
-    info "Non-interactive run — skipping VPN profile prompt"
+    echo -e "${BOLD}── AWS VPN Client profile ──${NC}"
+    echo ""
+    info "AWS VPN Client needs a Fido profile (.ovpn file) to connect."
+
+    if [ -t 0 ]; then
+        vpn_choice=$(fzf_pick "AWS VPN profile" \
+            "Paste config (.ovpn content) — read until Ctrl-D" \
+            "Provide a path to a .ovpn file" \
+            "Skip (set it up later in the AWS VPN Client UI)")
+
+        # Stage the user's input at a temp file first; we'll auto-import it
+        # into AWS VPN Client's registry below. ~/Documents copy is only
+        # kept as a fallback if the auto-import fails.
+        vpn_staged=""
+        case "$vpn_choice" in
+            Paste*)
+                echo ""
+                info "Paste the full .ovpn content, then press ${BOLD}Ctrl-D${NC} on a blank line:"
+                vpn_content="$(cat)"
+                if [ -n "$vpn_content" ]; then
+                    vpn_staged="$(mktemp "${TMPDIR:-/tmp}/fido-vpn.XXXXXX.ovpn")"
+                    printf '%s\n' "$vpn_content" > "$vpn_staged"
+                else
+                    warn "Empty paste — skipping"
+                fi
+                ;;
+            Provide*)
+                read -r -p "  Path to .ovpn: " vpn_src
+                vpn_src="${vpn_src/#\~/$HOME}"
+                if [ -f "$vpn_src" ]; then
+                    vpn_staged="$vpn_src"
+                else
+                    warn "File not found: ${vpn_src} — skipping"
+                fi
+                ;;
+            *) info "Skipped — set up the profile later via AWS VPN Client → File → Manage Profiles → Add Profile" ;;
+        esac
+
+        if [ -n "$vpn_staged" ]; then
+            if import_vpn_profile "$vpn_staged" "Fido VPN"; then
+                VPN_PROFILE_AUTO_IMPORTED=1
+                VPN_PROFILE_PATH="${HOME}/.config/AWSVPNClient/OpenVpnConfigs/Fido VPN"
+                success "Imported profile into AWS VPN Client (${BOLD}Fido VPN${NC})"
+                info "If AWS VPN Client is already running, quit and reopen it to see the profile."
+            else
+                # Parse failed — keep the file in ~/Documents so the user
+                # can still import it via the GUI.
+                mkdir -p "$VPN_PROFILE_DIR"
+                VPN_PROFILE_PATH="${VPN_PROFILE_DIR}/fido-vpn.ovpn"
+                cp "$vpn_staged" "$VPN_PROFILE_PATH"
+                warn "Couldn't auto-import — saved VPN config to ${BOLD}${VPN_PROFILE_PATH}${NC}"
+                info "Add it manually via AWS VPN Client → File → Manage Profiles → Add Profile."
+            fi
+            # Clean up the staged paste-tmp (but not a user-supplied file).
+            case "$vpn_choice" in Paste*) rm -f "$vpn_staged" ;; esac
+        fi
+    else
+        warn "Non-interactive run — skipping VPN profile prompt."
+        info "To set it up later, re-run interactively, or run:"
+        info "  ${BOLD}bash <(curl -fsSL https://raw.githubusercontent.com/FidoMoney/fido-agent-installer/main/install.sh)${NC}"
+        info "Or import the .ovpn manually via AWS VPN Client → File → Manage Profiles → Add Profile."
+    fi
 fi
 echo ""
 
@@ -476,6 +655,9 @@ if [ -d "${AGENT_REPO_DIR}/.git" ]; then
     fi
     if [ -n "$DEFAULT_BRANCH" ]; then
         git checkout "$DEFAULT_BRANCH" --quiet 2>/dev/null || true
+        if [ -n "$(git status --porcelain 2>/dev/null)" ]; then
+            warn "fido-agent — discarding uncommitted local changes ($(git status --porcelain 2>/dev/null | wc -l | tr -d ' ') file(s))"
+        fi
         git reset --hard "origin/${DEFAULT_BRANCH}" --quiet 2>/dev/null || true
     fi
     cd "$SCRIPT_DIR"
@@ -638,6 +820,7 @@ for dir in "${ROMAN_DIR}"/*/; do
         CURRENT_BRANCH=$(git branch --show-current 2>/dev/null || echo "")
 
         if [ -n "$(git status --porcelain 2>/dev/null)" ]; then
+            warn "${REPO_NAME} — discarding uncommitted local changes (was: $(git status --porcelain 2>/dev/null | wc -l | tr -d ' ') file(s))"
             git reset --hard HEAD --quiet 2>/dev/null || true
             git clean -fd --quiet 2>/dev/null || true
         fi
@@ -886,8 +1069,8 @@ echo ""
 
 # Prompt y/N only in full-setup interactive mode (skip in --mcp-only).
 if [ "$MCP_ONLY" = "0" ] && [ -t 0 ]; then
-    read -r -p "$(echo -e "  Install MCP servers now? [y/N] ")" reply
-    case "${reply:-}" in
+    read -r -p "$(echo -e "  Install MCP servers now? [Y/n] ")" reply
+    case "${reply:-Y}" in
         y|Y|yes|YES) ;;
         *) info "Skipped. Run later:  ${BOLD}bash <(curl -fsSL https://raw.githubusercontent.com/FidoMoney/fido-agent-installer/main/install.sh) --mcp-only${NC}"; echo ""; exit 0 ;;
     esac

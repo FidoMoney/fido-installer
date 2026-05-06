@@ -1,0 +1,161 @@
+name: test-install-ps1
+
+# Two jobs:
+#   - lint: PSScriptAnalyzer on Linux PowerShell. Catches syntax / style /
+#     common bugs without booting a Windows runner. Fast.
+#   - smoke-windows: real Windows runner. Parses, lints, runs the script
+#     in a "preflight" mode that exercises the early code paths
+#     (param block, banner, helper definitions, MCP catalog regex) without
+#     trying to install tools, hit the Fido VPN, or talk to GitHub-org
+#     repos that the runner has no access to.
+#
+# Trigger via GitHub UI: Actions → test-install-ps1 → Run workflow.
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - 'install.ps1'
+      - '.github/workflows/test-install-ps1.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'install.ps1'
+      - '.github/workflows/test-install-ps1.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: Lint (PSScriptAnalyzer)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run PSScriptAnalyzer
+        shell: pwsh
+        run: |
+          Install-Module -Name PSScriptAnalyzer -Force -Scope CurrentUser -ErrorAction Stop
+          $results = Invoke-ScriptAnalyzer -Path ./install.ps1 -Severity @('Error','Warning')
+          if ($results) {
+            $results | Format-Table -AutoSize | Out-String | Write-Host
+            $errs = $results | Where-Object Severity -eq 'Error'
+            if ($errs) { Write-Error "PSScriptAnalyzer found errors"; exit 1 }
+            Write-Host "::warning::PSScriptAnalyzer found warnings (non-fatal)"
+          } else {
+            Write-Host "PSScriptAnalyzer: clean"
+          }
+
+      - name: AST parse check
+        shell: pwsh
+        run: |
+          $err = $null
+          $null = [System.Management.Automation.Language.Parser]::ParseFile(
+            (Resolve-Path ./install.ps1).Path, [ref]$null, [ref]$err)
+          if ($err) {
+            $err | ForEach-Object { Write-Host ("{0}:{1} {2}" -f $_.Extent.StartLineNumber, $_.Extent.StartColumnNumber, $_.Message) }
+            Write-Error "Parse errors"; exit 1
+          }
+          Write-Host "Parse: OK"
+
+  smoke-windows:
+    name: Smoke test (windows-latest)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Show environment
+        shell: pwsh
+        run: |
+          $PSVersionTable | Out-Host
+          (Get-Command winget -ErrorAction SilentlyContinue) | Out-Host
+          (Get-Command git -ErrorAction SilentlyContinue) | Out-Host
+          (Get-Command gh -ErrorAction SilentlyContinue) | Out-Host
+
+      - name: AST parse check
+        shell: pwsh
+        run: |
+          $err = $null
+          $null = [System.Management.Automation.Language.Parser]::ParseFile(
+            (Resolve-Path .\install.ps1).Path, [ref]$null, [ref]$err)
+          if ($err) {
+            $err | ForEach-Object { Write-Host ("{0}:{1} {2}" -f $_.Extent.StartLineNumber, $_.Extent.StartColumnNumber, $_.Message) }
+            throw "Parse errors"
+          }
+
+      - name: Help / param block parses
+        shell: pwsh
+        run: |
+          # Loads the script's param block and comment-based help without
+          # executing the body. Catches param-binding mistakes early.
+          Get-Help .\install.ps1 -Full | Out-Host
+
+      - name: Dot-source helpers (no execution of main flow)
+        shell: pwsh
+        run: |
+          # Pull just the helper functions out of install.ps1 and verify
+          # they parse / load. Avoids running the install flow itself
+          # (which would try to install winget packages and clone Fido
+          # repos the runner has no access to).
+          $src = Get-Content -Raw .\install.ps1
+          $helperRegex = '(?ms)^function\s+(Print-Banner|Test-Admin|Refresh-Path|Has-Cmd|Test-VpnUp|Configure-DnsResolvers|Connect-Vpn|Select-One|Build-McpCatalog|Install-WingetPkg|Select-McpsFzf|Select-McpsNumbered|Test-Known)\b.*?^\}'
+          $helpers = [regex]::Matches($src, $helperRegex) | ForEach-Object { $_.Value }
+          if (-not $helpers) { throw "no helpers extracted — regex needs updating" }
+          $tmp = Join-Path $env:RUNNER_TEMP 'helpers.ps1'
+          # Module-scope vars referenced by helpers
+          @"
+`$ErrorActionPreference = 'Stop'
+`$MCP_DNS_DOMAIN = 'global-private.fido.money'
+`$MCP_DNS_ZONES  = @(
+    @{ Zone = 'global-private.fido.money'; Server = '10.3.0.2' }
+    @{ Zone = 'private.fido.money';        Server = '10.30.0.2' }
+)
+`$MCP_GITOPS_REPO = 'FidoMoney/platform-team-gitops'
+`$MCP_GITOPS_PATH = 'applications/mcp-servers'
+`$SkipDns = `$true
+`$DryRun = `$true
+function Write-Info  { param([string]`$m) Write-Host `$m }
+function Write-OK    { param([string]`$m) Write-Host `$m }
+function Write-Warn2 { param([string]`$m) Write-Host `$m }
+function Write-Fail  { param([string]`$m) Write-Host `$m }
+"@ | Set-Content $tmp
+          ($helpers -join "`n`n") | Add-Content $tmp
+          . $tmp
+          # Smoke-test the cheap, side-effect-free helpers
+          if (-not (Has-Cmd 'powershell')) { throw 'Has-Cmd false negative for powershell' }
+          if (Has-Cmd 'definitely-not-a-real-cmd') { throw 'Has-Cmd false positive' }
+          # Test-Admin should return a bool
+          if ($null -eq (Test-Admin)) { throw 'Test-Admin returned $null' }
+          # Test-VpnUp should return $false (no Fido VPN here)
+          if (Test-VpnUp) { throw 'Test-VpnUp unexpectedly true on a CI runner' }
+          # Configure-DnsResolvers should no-op in dry-run + skip-dns mode
+          Configure-DnsResolvers
+          Write-Host "Helpers loaded and smoke-tested OK"
+
+      - name: Verify required tools resolve via winget (search only)
+        shell: pwsh
+        run: |
+          # Don't actually install — just confirm the package IDs the
+          # script uses still resolve. Catches winget renames early.
+          $ids = @(
+            'Git.Git',
+            'GitHub.cli',
+            'junegunn.fzf',
+            'Amazon.AWSCLI',
+            'OpenJS.NodeJS',
+            'Amazon.AWSVPNClient'
+          )
+          $bad = @()
+          foreach ($id in $ids) {
+            $out = winget search --id $id -e --accept-source-agreements 2>&1 | Out-String
+            if ($out -notmatch [regex]::Escape($id)) {
+              Write-Host "::warning::winget search did not return $id"
+              $bad += $id
+            } else {
+              Write-Host "OK $id"
+            }
+          }
+          if ($bad.Count -gt 0) {
+            Write-Host "::warning::Some IDs failed to resolve: $($bad -join ', ')"
+          }
