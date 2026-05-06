@@ -229,7 +229,8 @@ Write-Host ""
 # -McpOnly mode (smaller scope) and in non-interactive runs.
 if (-not $McpOnly -and (Test-Interactive)) {
     Write-Host "This installer will:" -ForegroundColor White
-    Write-Host "  - Install winget packages: git, gh, fzf, awscli, Node.js, AWS VPN Client"
+    Write-Host "  - Install winget packages: git, gh, fzf, Node.js, AWS VPN Client"
+    Write-Host "  - Install AWS CLI (winget, with fallback to Amazon's official MSI)"
     Write-Host "  - Install Claude Code (via the official installer)"
     Write-Host "  - Verify AWS credentials, or walk you through 'aws configure sso' on first run"
     Write-Host "  - Clone/update Fido repos under $ScriptDir\fido-agent\"
@@ -286,7 +287,6 @@ if (-not $McpOnly) {
     Install-WingetPkg -Cmd 'git'  -Id 'Git.Git'         -Label 'Git'
     Install-WingetPkg -Cmd 'gh'   -Id 'GitHub.cli'      -Label 'GitHub CLI'
     Install-WingetPkg -Cmd 'fzf'  -Id 'junegunn.fzf'    -Label 'fzf (multi-select UI)'
-    Install-WingetPkg -Cmd 'aws'  -Id 'Amazon.AWSCLI'   -Label 'AWS CLI'
     Install-WingetPkg -Cmd 'node' -Id 'OpenJS.NodeJS'   -Label 'Node.js (for Claude Code)'
 
     # AWS VPN Client — no CLI binary, install by id only.
@@ -294,161 +294,427 @@ if (-not $McpOnly) {
 
     Refresh-Path
 
-    # ── Verify AWS credentials are configured ────────────────────
-    # Same flow as install.sh: try the default profile, try each
-    # named profile from `aws configure list-profiles`, offer
-    # `aws sso login` if there's an SSO profile, and finally walk
-    # first-time users through `aws configure sso` with the Fido
-    # SSO start URL/region pre-shown. Hard-exit with explicit next
-    # steps when nothing works (incl. "no AWS account yet — ping
-    # #eng-platform").
+    # AWS CLI — winget first; if that fails (managed laptops with the Store
+    # disabled, or ships a broken bundle), fall back to Amazon's official
+    # MSI from awscli.amazonaws.com. We always smoke-test `aws --version`
+    # afterwards so a broken install fails with a clear message instead of
+    # surfacing later as a confusing traceback inside Verify-AwsCreds.
+    function Test-AwsRuns {
+        try { & aws --version *> $null; return ($LASTEXITCODE -eq 0) }
+        catch { return $false }
+    }
 
-    $script:AwsCallerOutput = ''
+    function Install-AwsCliMsi {
+        $msi = Join-Path ([System.IO.Path]::GetTempPath()) "AWSCLIV2-$([guid]::NewGuid().ToString('N')).msi"
+        try {
+            Write-Info "Downloading AWS CLI MSI from awscli.amazonaws.com..."
+            Invoke-WebRequest -Uri 'https://awscli.amazonaws.com/AWSCLIV2.msi' -OutFile $msi -UseBasicParsing
+            Write-Info "Running MSI installer (UAC may prompt)..."
+            $proc = Start-Process -Wait -PassThru msiexec.exe -ArgumentList @('/i', $msi, '/qb')
+            return ($proc.ExitCode -eq 0)
+        } catch {
+            Write-Warn2 "AWS CLI MSI install failed: $_"
+            return $false
+        } finally {
+            Remove-Item -LiteralPath $msi -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    function Ensure-AwsCli {
+        Refresh-Path
+        if ((Has-Cmd 'aws') -and (Test-AwsRuns)) {
+            $ver = (& aws --version 2>&1) -join ' '
+            Write-OK "AWS CLI is installed ($ver)"
+            return $true
+        }
+        if (Has-Cmd 'aws') {
+            Write-Warn2 "AWS CLI is present but 'aws --version' fails — reinstalling"
+        } else {
+            Write-Info "Installing AWS CLI..."
+        }
+
+        try {
+            winget install --id 'Amazon.AWSCLI' -e --accept-package-agreements --accept-source-agreements --silent | Out-Null
+        } catch {
+            Write-Warn2 "winget failed for AWS CLI: $_"
+        }
+        Refresh-Path
+        if ((Has-Cmd 'aws') -and (Test-AwsRuns)) {
+            Write-OK "AWS CLI installed (via winget)"
+            return $true
+        }
+
+        Write-Warn2 "winget didn't produce a working 'aws' — falling back to direct MSI."
+        if (-not (Install-AwsCliMsi)) { return $false }
+        Refresh-Path
+        if ((Has-Cmd 'aws') -and (Test-AwsRuns)) {
+            $ver = (& aws --version 2>&1) -join ' '
+            Write-OK "AWS CLI installed via MSI ($ver)"
+            return $true
+        }
+        Write-Fail "AWS CLI installed but 'aws --version' still fails — open a new terminal and rerun."
+        return $false
+    }
+
+    # ── Validate Fido AWS access via SSO OIDC device flow ────────
+    # We deliberately don't shell out to `aws` for validation. The
+    # AWS CLI on the box may be stale, broken, or not yet installed
+    # — we want validation to keep working anyway. AWS publishes the
+    # SSO OIDC API as plain HTTP — three documented endpoints get us
+    # an access token, then list-accounts on the portal proves the
+    # token actually has Fido AWS access (not just SSO sign-in).
+    # We also write the access token to ~/.aws/sso/cache/ in the
+    # exact format the AWS CLI looks up, so the user's first `aws`
+    # command after this installer runs inherits the live session.
+
     $FidoSsoStartUrl = 'https://fido.awsapps.com/start/'
     $FidoSsoRegion   = 'eu-west-1'
+    $FidoSsoName     = 'fido'
+    $SsoOidcUrl      = "https://oidc.$FidoSsoRegion.amazonaws.com"
+    $SsoPortalUrl    = "https://portal.sso.$FidoSsoRegion.amazonaws.com"
 
-    function Get-AwsProfiles {
+    function Get-Sha1Hex {
+        param([string]$s)
+        $sha = [System.Security.Cryptography.SHA1]::Create()
         try {
-            $out = & aws configure list-profiles 2>$null
-            if ($LASTEXITCODE -ne 0 -or -not $out) { return @() }
-            return @($out | Where-Object { $_ -and $_.Trim() })
-        } catch {
-            return @()
-        }
+            $hash = $sha.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($s))
+            return -join ($hash | ForEach-Object { $_.ToString('x2') })
+        } finally { $sha.Dispose() }
     }
 
-    function Test-AwsProfileIsSso {
-        param([string]$Name)
-        $cfg = if ($env:AWS_CONFIG_FILE) { $env:AWS_CONFIG_FILE } else { Join-Path $HOME '.aws\config' }
-        if (-not (Test-Path $cfg)) { return $false }
-        $inSection = $false
-        foreach ($line in Get-Content -LiteralPath $cfg) {
-            if ($line -match '^\s*\[(profile\s+)?([^\]]+)\]\s*$') {
-                $inSection = ($Matches[2].Trim() -eq $Name)
+    # Stage to <path>.tmp then move into place. Uses UTF-8 *without*
+    # BOM — PS5.1's `Set-Content -Encoding UTF8` writes a BOM that
+    # some JSON parsers choke on. We avoid [System.IO.File]::Replace
+    # because the null-backup overload throws on .NET Core/macOS.
+    function Write-FileNoBom {
+        param([string]$Path, [string]$Content)
+        $dir = Split-Path -Parent $Path
+        if ($dir -and -not (Test-Path $dir)) { New-Item -ItemType Directory -Force -Path $dir | Out-Null }
+        $tmp = "$Path.tmp"
+        [System.IO.File]::WriteAllText($tmp, $Content, (New-Object System.Text.UTF8Encoding($false)))
+        Move-Item -LiteralPath $tmp -Destination $Path -Force
+    }
+
+    # Pull the {"error":"..."} field out of a 4xx response body.
+    # Works on PS5.1 (response stream) and PS7 (ErrorDetails.Message).
+    function Get-OidcErrorCode {
+        param($ErrorRecord)
+        $body = $null
+        if ($ErrorRecord.ErrorDetails -and $ErrorRecord.ErrorDetails.Message) {
+            $body = $ErrorRecord.ErrorDetails.Message
+        } elseif ($ErrorRecord.Exception.Response) {
+            try {
+                $stream = $ErrorRecord.Exception.Response.GetResponseStream()
+                if ($stream.CanSeek) { $stream.Position = 0 }
+                $body = (New-Object System.IO.StreamReader($stream)).ReadToEnd()
+            } catch { }
+        }
+        if (-not $body) { return $null }
+        try { return ($body | ConvertFrom-Json).error } catch { return $null }
+    }
+
+    # Returns the cached access token if a valid (non-expired) Fido
+    # SSO session exists, else $null.
+    #
+    # Subtlety: ConvertFrom-Json auto-coerces ISO 8601 strings to
+    # System.DateTime. Going back through [DateTimeOffset]::Parse on
+    # that DateTime loses the UTC kind and re-applies the host's local
+    # offset, which silently inverts the comparison under non-UTC
+    # timezones. Read the DateTime's universal time directly instead.
+    function Get-CachedFidoSsoToken {
+        $cache = Join-Path $HOME '.aws\sso\cache'
+        if (-not (Test-Path $cache)) { return $null }
+        $now = [DateTimeOffset]::UtcNow
+        foreach ($f in (Get-ChildItem -LiteralPath $cache -Filter '*.json' -File -ErrorAction SilentlyContinue)) {
+            try { $d = Get-Content -LiteralPath $f.FullName -Raw | ConvertFrom-Json } catch { continue }
+            if ($d.startUrl -ne $FidoSsoStartUrl) { continue }
+            try {
+                $exp = if ($d.expiresAt -is [datetime]) {
+                    [DateTimeOffset]::new($d.expiresAt.ToUniversalTime())
+                } else {
+                    [DateTimeOffset]::Parse([string]$d.expiresAt,
+                        [System.Globalization.CultureInfo]::InvariantCulture,
+                        [System.Globalization.DateTimeStyles]::AssumeUniversal -bor
+                        [System.Globalization.DateTimeStyles]::AdjustToUniversal)
+                }
+            } catch { continue }
+            if ($exp -gt $now -and $d.accessToken) { return $d.accessToken }
+        }
+        return $null
+    }
+
+    # Run the SSO OIDC device-authorization flow. On success returns
+    # the access token (string) and writes the cache file. Returns
+    # $null on any failure.
+    function Invoke-FidoSsoOidcLogin {
+        $cache = Join-Path $HOME '.aws\sso\cache'
+        New-Item -ItemType Directory -Force -Path $cache | Out-Null
+
+        Write-Info "Registering OIDC client..."
+        try {
+            $reg = Invoke-RestMethod -Method Post -Uri "$SsoOidcUrl/client/register" `
+                -ContentType 'application/json' `
+                -Body '{"clientName":"fido-installer","clientType":"public","scopes":["sso:account:access"]}'
+        } catch {
+            Write-Fail "OIDC client registration failed: $_"
+            return $null
+        }
+        if (-not $reg.clientId -or -not $reg.clientSecret) {
+            Write-Fail "OIDC register: bad response"
+            return $null
+        }
+
+        Write-Info "Starting device authorization..."
+        $body = (@{ clientId=$reg.clientId; clientSecret=$reg.clientSecret; startUrl=$FidoSsoStartUrl } |
+                 ConvertTo-Json -Compress)
+        try {
+            $auth = Invoke-RestMethod -Method Post -Uri "$SsoOidcUrl/device_authorization" `
+                -ContentType 'application/json' -Body $body
+        } catch {
+            Write-Fail "Device authorization request failed: $_"
+            return $null
+        }
+        if (-not $auth.deviceCode -or -not $auth.verificationUriComplete) {
+            Write-Fail "Bad device_authorization response"
+            return $null
+        }
+        $interval  = if ($auth.interval)  { [int]$auth.interval }  else { 5 }
+        $expiresIn = if ($auth.expiresIn) { [int]$auth.expiresIn } else { 600 }
+
+        Write-Host ""
+        Write-Info "Opening Fido SSO in your browser..."
+        Write-Info "Verification code: $($auth.userCode)"
+        Write-Info "If the browser doesn't open: $($auth.verificationUriComplete)"
+        try { Start-Process $auth.verificationUriComplete | Out-Null } catch { }
+        Write-Host ""
+        Write-Info "Waiting for you to approve in the browser (up to $([math]::Floor($expiresIn/60))min)..."
+
+        # Poll /token until the user finishes the browser flow. While
+        # the user is still authenticating, /token returns HTTP 400 +
+        # {"error":"authorization_pending"}; we catch that and keep
+        # polling. AWS uses "slow_down" to ask us to back off.
+        $tokenBody = (@{
+            clientId     = $reg.clientId
+            clientSecret = $reg.clientSecret
+            grantType    = 'urn:ietf:params:oauth:grant-type:device_code'
+            deviceCode   = $auth.deviceCode
+        } | ConvertTo-Json -Compress)
+        $deadline = [DateTimeOffset]::UtcNow.AddSeconds($expiresIn)
+
+        $accessToken    = $null
+        $expiresInToken = 28800
+        while ([DateTimeOffset]::UtcNow -lt $deadline) {
+            try {
+                $tok = Invoke-RestMethod -Method Post -Uri "$SsoOidcUrl/token" `
+                    -ContentType 'application/json' -Body $tokenBody -ErrorAction Stop
+                if ($tok.accessToken) {
+                    $accessToken = $tok.accessToken
+                    if ($tok.expiresIn) { $expiresInToken = [int]$tok.expiresIn }
+                    break
+                }
+            } catch {
+                $err = Get-OidcErrorCode -ErrorRecord $_
+                switch ($err) {
+                    'authorization_pending' { }
+                    'slow_down'             { $interval += 5 }
+                    $null                   { Write-Warn2 "Empty error from /token, retrying" }
+                    default                 { Write-Fail "Sign-in failed ($err)"; return $null }
+                }
+            }
+            Start-Sleep -Seconds $interval
+        }
+        if (-not $accessToken) { Write-Fail "Timed out waiting for browser sign-in"; return $null }
+
+        # Write cache under both name-hash and url-hash keys (modern +
+        # legacy CLI lookup paths).
+        $expiresAt = ([DateTimeOffset]::UtcNow.AddSeconds($expiresInToken)).ToString('yyyy-MM-ddTHH:mm:ssZ')
+        $cacheData = [pscustomobject]@{
+            startUrl     = $FidoSsoStartUrl
+            region       = $FidoSsoRegion
+            accessToken  = $accessToken
+            expiresAt    = $expiresAt
+            clientId     = $reg.clientId
+            clientSecret = $reg.clientSecret
+        }
+        $json = $cacheData | ConvertTo-Json -Compress
+        $keys = @((Get-Sha1Hex $FidoSsoName), (Get-Sha1Hex $FidoSsoStartUrl)) | Sort-Object -Unique
+        foreach ($k in $keys) {
+            $path = Join-Path $cache "$k.json"
+            try { Write-FileNoBom -Path $path -Content $json }
+            catch { Write-Warn2 "Couldn't write cache file ${path}: $_" }
+        }
+
+        return $accessToken
+    }
+
+    # Validate access by listing accounts. Returns the count.
+    function Get-FidoSsoAccountCount {
+        param([string]$Token)
+        try {
+            $r = Invoke-RestMethod -Uri "$SsoPortalUrl/federation/list-accounts?max_result=100" `
+                -Headers @{ 'x-amz-sso_bearer_token' = $Token } -ErrorAction Stop
+            return @($r.accountList).Count
+        } catch { return 0 }
+    }
+
+    # Have the user pick an account & role. Returns
+    # @{accountId; accountName; roleName} or $null.
+    function Select-FidoSsoAccountRole {
+        param([string]$Token)
+        $headers = @{ 'x-amz-sso_bearer_token' = $Token }
+        try {
+            $accounts = Invoke-RestMethod -Uri "$SsoPortalUrl/federation/list-accounts?max_result=100" `
+                -Headers $headers -ErrorAction Stop
+        } catch { return $null }
+        $accountList = @($accounts.accountList)
+        if ($accountList.Count -eq 0) { return $null }
+
+        $a = $null
+        if ($accountList.Count -eq 1) {
+            $a = $accountList[0]
+        } else {
+            $items = $accountList | ForEach-Object { "$($_.accountName)  ($($_.accountId))" }
+            $pick = Select-One -Prompt 'Pick an AWS account' -Items $items
+            if (-not $pick) { return $null }
+            $a = $accountList | Where-Object { "$($_.accountName)  ($($_.accountId))" -eq $pick } | Select-Object -First 1
+        }
+        if (-not $a) { return $null }
+
+        try {
+            $roles = Invoke-RestMethod -Uri "$SsoPortalUrl/federation/list-account-roles?account_id=$($a.accountId)&max_result=100" `
+                -Headers $headers -ErrorAction Stop
+        } catch { return $null }
+        $roleList = @($roles.roleList)
+        if ($roleList.Count -eq 0) { return $null }
+
+        $role = $null
+        if ($roleList.Count -eq 1) {
+            $role = $roleList[0].roleName
+        } else {
+            $names = $roleList | ForEach-Object { $_.roleName }
+            $role = Select-One -Prompt 'Pick a role' -Items $names
+            if (-not $role) { return $null }
+        }
+        return @{ accountId = $a.accountId; accountName = $a.accountName; roleName = $role }
+    }
+
+    # Hand-rolled INI editor for ~/.aws/config. Replaces the named
+    # section in-place and preserves every other section verbatim.
+    # Appends if the section doesn't already exist.
+    function Set-AwsConfigSection {
+        param([string]$Path, [string]$Section, [hashtable]$KeyValues)
+        $lines = if (Test-Path $Path) { @(Get-Content -LiteralPath $Path) } else { @() }
+        $out = New-Object System.Collections.Generic.List[string]
+        $inTarget = $false
+        $written  = $false
+        foreach ($line in $lines) {
+            if ($line -match '^\s*\[(.+?)\]\s*$') {
+                $inTarget = ($Matches[1] -eq $Section)
+                $out.Add($line)
+                if ($inTarget) {
+                    foreach ($k in $KeyValues.Keys) { $out.Add("$k = $($KeyValues[$k])") }
+                    $written = $true
+                }
                 continue
             }
-            if ($line -match '^\s*\[') { $inSection = $false; continue }
-            if ($inSection -and $line -match '^\s*sso_(start_url|session)\s*=') {
-                return $true
-            }
+            if ($inTarget) { continue }   # drop the old contents of the target section
+            $out.Add($line)
         }
-        return $false
+        if (-not $written) {
+            if ($out.Count -gt 0 -and $out[$out.Count - 1] -ne '') { $out.Add('') }
+            $out.Add("[$Section]")
+            foreach ($k in $KeyValues.Keys) { $out.Add("$k = $($KeyValues[$k])") }
+        }
+        Write-FileNoBom -Path $Path -Content (($out -join "`n") + "`n")
     }
 
-    function Invoke-AwsStsCheck {
-        param([string]$ProfileName)
-        $cmdArgs = @('sts','get-caller-identity','--output','json')
-        if ($ProfileName) { $cmdArgs += @('--profile', $ProfileName) }
-        $out = & aws @cmdArgs 2>&1
-        if ($LASTEXITCODE -eq 0) {
-            $arn = $null
-            $m = [regex]::Match(($out | Out-String), '"Arn":\s*"([^"]+)"')
-            if ($m.Success) { $arn = $m.Groups[1].Value }
-            return @{ Ok = $true; Arn = $arn }
+    function Write-FidoSsoConfig {
+        param([string]$AccountId, [string]$RoleName)
+        $cfg = if ($env:AWS_CONFIG_FILE) { $env:AWS_CONFIG_FILE } else { Join-Path $HOME '.aws\config' }
+        Set-AwsConfigSection -Path $cfg -Section "sso-session $FidoSsoName" -KeyValues @{
+            sso_start_url           = $FidoSsoStartUrl
+            sso_region              = $FidoSsoRegion
+            sso_registration_scopes = 'sso:account:access'
         }
-        $script:AwsCallerOutput = ($out | Out-String).Trim()
-        return @{ Ok = $false; Arn = $null }
+        Set-AwsConfigSection -Path $cfg -Section "profile $FidoSsoName" -KeyValues @{
+            sso_session    = $FidoSsoName
+            sso_account_id = $AccountId
+            sso_role_name  = $RoleName
+            region         = $FidoSsoRegion
+            output         = 'json'
+        }
     }
 
-    function Verify-AwsCreds {
-        $r = Invoke-AwsStsCheck -ProfileName ''
-        if ($r.Ok) {
-            Write-OK "AWS credentials valid ($($r.Arn))"
+    function Ensure-FidoSso {
+        $token = Get-CachedFidoSsoToken
+        if ($token) {
+            Write-OK "Active Fido SSO session found"
+            if (-not $env:AWS_PROFILE) { $env:AWS_PROFILE = $FidoSsoName }
             return $true
         }
 
-        $profiles = @(Get-AwsProfiles | Sort-Object -Unique)
-        foreach ($p in $profiles) {
-            $r = Invoke-AwsStsCheck -ProfileName $p
-            if ($r.Ok) {
-                $env:AWS_PROFILE = $p
-                Write-OK "AWS credentials valid via profile $p ($($r.Arn))"
-                Write-Info "Using AWS_PROFILE=$p for this installer run."
-                Write-Info "To make it permanent, run: setx AWS_PROFILE $p"
-                return $true
-            }
+        if (-not (Test-Interactive)) {
+            Write-Fail "No active Fido SSO session and stdin isn't a terminal — can't run the device flow."
+            return $false
         }
 
-        $ssoProfiles = @($profiles | Where-Object { Test-AwsProfileIsSso $_ })
-        if ($ssoProfiles.Count -eq 0) { return $false }
-        if (-not (Test-Interactive)) { return $false }
+        Write-Info "Starting Fido AWS SSO sign-in (no AWS CLI required)..."
+        $token = Invoke-FidoSsoOidcLogin
+        if (-not $token) { return $false }
 
-        $chosen = if ($ssoProfiles.Count -eq 1) {
-            Write-Info "Found SSO profile $($ssoProfiles[0]) — running aws sso login..."
-            $ssoProfiles[0]
+        Write-Info "Validating Fido AWS account access..."
+        $n = Get-FidoSsoAccountCount -Token $token
+        if ($n -lt 1) {
+            Write-Fail "Sign-in succeeded but no AWS accounts are assigned to your Fido SSO user."
+            return $false
+        }
+        Write-OK "Fido SSO sign-in succeeded — $n account(s) available"
+
+        $cfg = if ($env:AWS_CONFIG_FILE) { $env:AWS_CONFIG_FILE } else { Join-Path $HOME '.aws\config' }
+        $hasFido = (Test-Path $cfg) -and (Select-String -LiteralPath $cfg -Pattern 'fido\.awsapps\.com/start' -Quiet)
+        if (-not $hasFido) {
+            Write-Info "Picking a default AWS account+role for the $FidoSsoName profile..."
+            $picked = Select-FidoSsoAccountRole -Token $token
+            if ($picked) {
+                try {
+                    Write-FidoSsoConfig -AccountId $picked.accountId -RoleName $picked.roleName
+                    Write-OK "Wrote profile $FidoSsoName -> $($picked.accountName) ($($picked.roleName))"
+                    Write-Info "To make it your default, run: setx AWS_PROFILE $FidoSsoName"
+                } catch {
+                    Write-Warn2 "Couldn't write ~/.aws/config: $_"
+                }
+            } else {
+                Write-Warn2 "Skipped account/role picker — run 'aws configure sso' later if you want a CLI profile."
+            }
         } else {
-            Select-One -Prompt 'Pick AWS SSO profile to log in' -Items $ssoProfiles
+            Write-OK "Fido SSO already in ~/.aws/config — refreshed session cache"
         }
-        if (-not $chosen) { return $false }
-
-        & aws sso login --profile $chosen
-        if ($LASTEXITCODE -ne 0) { return $false }
-
-        $r = Invoke-AwsStsCheck -ProfileName $chosen
-        if ($r.Ok) {
-            $env:AWS_PROFILE = $chosen
-            Write-OK "AWS credentials valid via profile $chosen ($($r.Arn))"
-            Write-Info "Using AWS_PROFILE=$chosen for this installer run."
-            Write-Info "To make it permanent, run: setx AWS_PROFILE $chosen"
-            return $true
-        }
-        return $false
+        if (-not $env:AWS_PROFILE) { $env:AWS_PROFILE = $FidoSsoName }
+        return $true
     }
 
-    function Bootstrap-AwsSso {
-        if (-not (Test-Interactive)) { return $false }
-
+    # Validate Fido SSO access first (cheap, no admin rights). If the
+    # user has no Fido AWS account we can fail before installing the
+    # CLI and before prompting for elevation.
+    if (-not (Ensure-FidoSso)) {
         Write-Host ""
-        Write-Host "── First-time AWS SSO setup ──" -ForegroundColor White
-        Write-Host ""
-        Write-Info "No working AWS credentials found. Let's set up Fido AWS SSO."
-        Write-Info "I'll run 'aws configure sso' — when prompted, enter these values:"
-        Write-Host ""
-        Write-Info "  SSO session name:        fido"
-        Write-Info "  SSO start URL:           $FidoSsoStartUrl"
-        Write-Info "  SSO region:              $FidoSsoRegion"
-        Write-Info "  SSO registration scopes: sso:account:access (or press Enter)"
-        Write-Host ""
-        Write-Info "A browser will open for you to authenticate to Fido SSO."
-        Write-Info "After login you'll pick your account and role from a list."
-        Write-Host ""
-        Write-Info "Final prompts:"
-        Write-Info "  CLI default Region:  $FidoSsoRegion"
-        Write-Info "  CLI default output:  json"
-        Write-Info "  CLI profile name:    fido (any name works)"
-        Write-Host ""
-        Read-Host "Press Enter to start, or Ctrl-C to abort" | Out-Null
-        Write-Host ""
-
-        & aws configure sso
-        if ($LASTEXITCODE -ne 0) { return $false }
-
-        Write-Host ""
-        Write-OK "'aws configure sso' completed."
-        if (Verify-AwsCreds) { return $true }
-        Write-Warn2 "Setup finished but credentials still don't validate — see message below."
-        return $false
-    }
-
-    if (-not (Verify-AwsCreds) -and -not (Bootstrap-AwsSso)) {
-        Write-Host ""
-        Write-Fail "Couldn't establish working AWS credentials."
-        if ($script:AwsCallerOutput) { Write-Fail "Details: $script:AwsCallerOutput" }
+        Write-Fail "Couldn't establish Fido AWS SSO access."
         Write-Host ""
         Write-Info "Don't have a Fido AWS account yet?"
         Write-Info "  Ping #eng-platform on Slack to request one."
         Write-Info "  Once it's created, re-run this installer."
         Write-Host ""
-        Write-Info "SSO login failed (browser/auth error)?"
-        Write-Info "  Re-run 'aws configure sso' manually, then re-run this installer."
+        Write-Info "Browser sign-in failed or timed out?"
+        Write-Info "  Re-run this installer and complete the SSO step in your browser."
         Write-Host ""
-        Write-Info "Already configured under a different profile?"
-        Write-Info "  Run 'setx AWS_PROFILE <your-profile-name>' before rerunning,"
-        Write-Info "  or 'aws sso login --profile <your-profile-name>' to refresh."
-        Write-Host ""
-        Write-Fail "Aborting installer — re-run once AWS access is set up."
+        Write-Fail "Aborting installer — re-run once SSO sign-in succeeds."
         exit 1
     }
+
+    # Install the AWS CLI for downstream use. The OIDC cache we just
+    # wrote is in the format the CLI expects, so the user's first
+    # `aws` command inherits the live session — no second login.
+    if (-not (Ensure-AwsCli)) { exit 1 }
 
     # ── AWS VPN Client profile ───────────────────────────────────
     # Skip the prompt entirely if AWS VPN Client already has at least
