@@ -88,10 +88,14 @@ DIM='\033[2;37m'
 PINK='\033[38;2;214;8;107m'   # Fido brand pink (#d6086b)
 NC='\033[0m'
 
-info()    { echo -e "${BLUE}ℹ${NC}  $1"; }
-success() { echo -e "${GREEN}✔${NC}  $1"; }
-warn()    { echo -e "${YELLOW}⚠${NC}  $1"; }
-fail()    { echo -e "${RED}✖${NC}  $1"; }
+# All diagnostics go to stderr so functions that need to return a value
+# via stdout (sso_oidc_login → access token, sso_list_accounts → count,
+# sso_pick_account_role → tab-separated picks) can call them freely
+# without their progress lines getting captured by `$(...)`.
+info()    { echo -e "${BLUE}ℹ${NC}  $1" >&2; }
+success() { echo -e "${GREEN}✔${NC}  $1" >&2; }
+warn()    { echo -e "${YELLOW}⚠${NC}  $1" >&2; }
+fail()    { echo -e "${RED}✖${NC}  $1" >&2; }
 
 # Single-select picker via fzf. Echoes the chosen line, or empty on cancel.
 # Lines are passed as args. Caller decides how to interpret the result.
@@ -197,9 +201,10 @@ echo ""
 # --mcp-only mode (smaller scope) and in non-interactive runs.
 if [ "$MCP_ONLY" = "0" ] && [ -t 0 ]; then
     echo -e "${BOLD}This installer will:${NC}"
-    echo "  • Install Homebrew packages: gh, fzf, awscli, AWS VPN Client (cask)"
+    echo "  • Install Homebrew packages: gh, fzf, AWS VPN Client (cask)"
+    echo "  • Install AWS CLI from Amazon's official pkg (awscli.amazonaws.com)"
     echo "  • Install Claude Code (via the official installer at claude.ai/install.sh)"
-    echo "  • Verify AWS credentials, or walk you through ${BOLD}aws configure sso${NC} on first run"
+    echo "  • Sign you in to Fido AWS SSO via your browser (no password to type)"
     echo "  • Clone/update Fido repos under ${BOLD}${SCRIPT_DIR}/fido-agent/${NC}"
     echo "  • Configure macOS DNS resolvers under ${BOLD}/etc/resolver/${NC} (asks for sudo)"
     echo "  • Import a Fido VPN profile into ${BOLD}~/.config/AWSVPNClient/${NC}"
@@ -221,13 +226,27 @@ CLONED=0; SKIPPED=0; CLONE_FAILED=0; UPDATED=0; UPDATE_FAILED=0
 if [ "$MCP_ONLY" = "0" ]; then
 
 # ── Step 1: Ensure Xcode Command Line Tools (provides git) ───────
+# `xcode-select --install` shows a system popup. If the user clicks
+# "Install" the install runs in the background; we poll for `git`.
+# If they hit "Cancel" / dismiss it, the popup goes away and `git`
+# never appears — so cap the wait at 15 minutes with a recovery hint
+# instead of spinning forever.
 if ! command -v git &> /dev/null; then
     info "Installing developer tools (this includes git)..."
-    info "A popup may appear — click ${BOLD}Install${NC} and wait for it to finish."
+    info "A popup will appear — click ${BOLD}Install${NC} and wait for it to finish."
     xcode-select --install 2>/dev/null || true
 
+    waited=0
     until command -v git &> /dev/null; do
         sleep 5
+        waited=$((waited + 5))
+        if [ "$waited" -ge 900 ]; then
+            fail "Timed out waiting for the Command Line Tools install (15 min)."
+            fail "If you dismissed the popup, run this in another terminal:"
+            fail "  ${BOLD}xcode-select --install${NC}"
+            fail "Then re-run this installer once it finishes."
+            exit 1
+        fi
     done
     success "Developer tools installed"
 else
@@ -249,7 +268,7 @@ else
     success "Homebrew is installed"
 fi
 
-# ── Step 3: Ensure CLI tools (gh, fzf, awscli) ──────────────────
+# ── Step 3: Ensure CLI tools (gh, fzf) ──────────────────────────
 install_brew_pkg() {
     local cmd="$1" pkg="$2" label="$3"
     if command -v "$cmd" &> /dev/null; then
@@ -263,156 +282,400 @@ install_brew_pkg() {
 
 install_brew_pkg gh  gh      "GitHub CLI"
 install_brew_pkg fzf fzf     "fzf (nice multi-select UI)"
-install_brew_pkg aws awscli  "AWS CLI"
 
-# ── Verify AWS credentials are configured ───────────────────────
-# Fail fast if the user has no working AWS identity. Many downstream
-# steps (VPN profile, MCP token retrieval, infra access) assume an AWS
-# user is reachable; surfacing this here gives a clear error instead
-# of cryptic failures later.
-#
-# Profile names differ per user (e.g. `fido`, `dev`, `john-sso`). SSO
-# users commonly have a named profile but no AWS_PROFILE set in their
-# shell, so the bare `sts` call hits the empty `default` profile and
-# fails. We discover whatever profiles exist on this machine: try the
-# default, then scan ~/.aws/config and try each named profile, then
-# offer `aws sso login` for SSO profiles when nothing has a live session.
-
-list_aws_profiles() {
-    aws configure list-profiles 2>/dev/null || true
-}
-
-profile_is_sso() {
-    local prof="$1" cfg="${AWS_CONFIG_FILE:-${HOME}/.aws/config}"
-    [ -f "$cfg" ] || return 1
-    awk -v target="$prof" '
-        /^\[(profile [^]]+|default)\]/ {
-            name = $0
-            sub(/^\[(profile )?/, "", name); sub(/\]$/, "", name)
-            in_section = (name == target)
-            next
-        }
-        /^\[/ { in_section = 0; next }
-        in_section && /^[[:space:]]*sso_(start_url|session)[[:space:]]*=/ { found = 1 }
-        END { exit !found }
-    ' "$cfg"
-}
-
-verify_aws_creds() {
-    local out arn p
-    if out=$(aws sts get-caller-identity --output json 2>&1); then
-        arn=$(echo "$out" | awk -F'"' '/Arn/ {print $4}')
-        success "AWS credentials valid (${BOLD}${arn:-unknown}${NC})"
+# AWS CLI — install Amazon's official pkg, not brew's awscli. The brew
+# bottle has a recurring breakage where a python@3.14 bump leaves
+# pyexpat referencing a libexpat symbol the system dylib doesn't export
+# (`_XML_SetAllocTrackerActivationThreshold`), so every `aws` invocation
+# crashes at import time. The Apple-signed pkg from awscli.amazonaws.com
+# bundles its own runtime and avoids the entanglement entirely.
+ensure_aws_cli() {
+    if command -v aws &>/dev/null && aws --version &>/dev/null; then
+        success "AWS CLI is installed ($(aws --version 2>&1))"
         return 0
     fi
-    aws_caller_output="$out"
 
-    local profiles
-    profiles=$(list_aws_profiles | awk '!seen[$0]++' || true)
-    [ -z "$profiles" ] && return 1
-
-    while IFS= read -r p; do
-        [ -z "$p" ] && continue
-        if out=$(aws sts get-caller-identity --profile "$p" --output json 2>&1); then
-            arn=$(echo "$out" | awk -F'"' '/Arn/ {print $4}')
-            export AWS_PROFILE="$p"
-            success "AWS credentials valid via profile ${BOLD}${p}${NC} (${arn:-unknown})"
-            info "Using ${BOLD}AWS_PROFILE=${p}${NC} for this installer run."
-            info "To make it permanent, add ${BOLD}export AWS_PROFILE=${p}${NC} to your shell rc."
-            return 0
+    if command -v aws &>/dev/null; then
+        warn "AWS CLI is present but \`aws --version\` fails — replacing with the official pkg"
+        if brew list awscli &>/dev/null; then
+            info "Removing the broken Homebrew awscli..."
+            brew uninstall awscli &>/dev/null || true
+            hash -r 2>/dev/null || true
         fi
-    done <<< "$profiles"
-
-    local -a sso_profiles=()
-    while IFS= read -r p; do
-        [ -z "$p" ] && continue
-        profile_is_sso "$p" && sso_profiles+=("$p")
-    done <<< "$profiles"
-
-    [ "${#sso_profiles[@]}" -eq 0 ] && return 1
-    [ -t 0 ] || return 1
-
-    local chosen
-    if [ "${#sso_profiles[@]}" -eq 1 ]; then
-        chosen="${sso_profiles[0]}"
-        info "Found SSO profile ${BOLD}${chosen}${NC} — running ${BOLD}aws sso login${NC}..."
     else
-        chosen=$(fzf_pick "Pick AWS SSO profile to log in" "${sso_profiles[@]}")
-        [ -z "$chosen" ] && return 1
+        info "Installing AWS CLI (Amazon's official pkg)..."
     fi
 
-    if aws sso login --profile "$chosen"; then
-        if out=$(aws sts get-caller-identity --profile "$chosen" --output json 2>&1); then
-            arn=$(echo "$out" | awk -F'"' '/Arn/ {print $4}')
-            export AWS_PROFILE="$chosen"
-            success "AWS credentials valid via profile ${BOLD}${chosen}${NC} (${arn:-unknown})"
-            info "Using ${BOLD}AWS_PROFILE=${chosen}${NC} for this installer run."
-            info "To make it permanent, add ${BOLD}export AWS_PROFILE=${chosen}${NC} to your shell rc."
-            return 0
-        fi
-        aws_caller_output="$out"
+    local tmpdir pkg
+    tmpdir="$(mktemp -d)"
+    pkg="${tmpdir}/AWSCLIV2.pkg"
+    if ! curl -fsSL "https://awscli.amazonaws.com/AWSCLIV2.pkg" -o "$pkg"; then
+        rm -rf "$tmpdir"
+        fail "Couldn't download AWS CLI installer from awscli.amazonaws.com"
+        return 1
     fi
+    info "Running AWS CLI installer (sudo — may prompt for your Mac password)..."
+    if ! sudo installer -pkg "$pkg" -target / >/dev/null; then
+        rm -rf "$tmpdir"
+        fail "AWS CLI installation failed."
+        return 1
+    fi
+    rm -rf "$tmpdir"
+
+    # Official installer drops `aws` at /usr/local/bin/aws — make sure
+    # it's on PATH for the rest of this script run.
+    if ! command -v aws &>/dev/null && [ -x /usr/local/bin/aws ]; then
+        export PATH="/usr/local/bin:${PATH}"
+    fi
+    hash -r 2>/dev/null || true
+    if aws --version &>/dev/null; then
+        success "AWS CLI installed ($(aws --version 2>&1))"
+        return 0
+    fi
+    fail "AWS CLI installed but \`aws --version\` still fails — open a new terminal and rerun."
     return 1
 }
 
-# First-time SSO setup: walk a brand-new user through `aws configure sso`
-# with the Fido start URL/region. Only invoked when verify_aws_creds has
-# already failed (no working profile). Returns 0 if bootstrap produced a
-# working profile, 1 otherwise.
+# ── Validate Fido AWS access via SSO OIDC device flow ───────────
+# We deliberately don't shell out to `aws` for validation. The brew
+# bottle of awscli has a recurring breakage that takes the CLI down
+# at import time, and the validation step needs to keep working even
+# when the CLI is stale, broken, or not yet installed. AWS publishes
+# the SSO OIDC API as plain HTTP — three documented endpoints are
+# enough to get an access token:
+#   POST oidc.<region>.amazonaws.com/client/register
+#   POST oidc.<region>.amazonaws.com/device_authorization
+#   POST oidc.<region>.amazonaws.com/token
+# Then list-accounts on portal.sso.<region>.amazonaws.com proves the
+# token actually has Fido AWS access (not just Auth0/SSO sign-in).
+# We also write the access token to ~/.aws/sso/cache/ in the format
+# the AWS CLI looks up, so the user's first `aws` command after this
+# installer runs inherits the live session — no second login.
+
 FIDO_SSO_START_URL="https://fido.awsapps.com/start/"
 FIDO_SSO_REGION="eu-west-1"
+FIDO_SSO_NAME="fido"
+SSO_OIDC_URL="https://oidc.${FIDO_SSO_REGION}.amazonaws.com"
+SSO_PORTAL_URL="https://portal.sso.${FIDO_SSO_REGION}.amazonaws.com"
 
-bootstrap_aws_sso() {
-    [ -t 0 ] || return 1
-
-    echo ""
-    echo -e "${BOLD}── First-time AWS SSO setup ──${NC}"
-    echo ""
-    info "No working AWS credentials found. Let's set up Fido AWS SSO."
-    info "I'll run ${BOLD}aws configure sso${NC} — when prompted, enter these values:"
-    echo ""
-    info "  SSO session name:        ${BOLD}fido${NC}"
-    info "  SSO start URL:           ${BOLD}${FIDO_SSO_START_URL}${NC}"
-    info "  SSO region:              ${BOLD}${FIDO_SSO_REGION}${NC}"
-    info "  SSO registration scopes: ${BOLD}sso:account:access${NC} (or press Enter)"
-    echo ""
-    info "A browser will open for you to authenticate to Fido SSO."
-    info "After login you'll pick your account and role from a list."
-    echo ""
-    info "Final prompts:"
-    info "  CLI default Region:  ${BOLD}${FIDO_SSO_REGION}${NC}"
-    info "  CLI default output:  ${BOLD}json${NC}"
-    info "  CLI profile name:    ${BOLD}fido${NC} (any name works)"
-    echo ""
-    read -r -p "$(echo -e "${BOLD}Press Enter to start, or Ctrl-C to abort: ${NC}")" _
-    echo ""
-
-    if aws configure sso; then
-        echo ""
-        success "${BOLD}aws configure sso${NC} completed."
-        verify_aws_creds && return 0
-        warn "Setup finished but credentials still don't validate — see message below."
-    fi
-    return 1
+# Read a top-level scalar field from a JSON string. Empty if missing.
+json_field() {
+    python3 -c '
+import json, sys
+try:    d = json.loads(sys.argv[1])
+except: d = {}
+v = d.get(sys.argv[2])
+print("" if v is None else v)
+' "$1" "$2" 2>/dev/null
 }
 
-if ! verify_aws_creds && ! bootstrap_aws_sso; then
+# Sha1-hex the given string. Used to compute the AWS SSO cache filename.
+sha1_hex() { printf '%s' "$1" | shasum -a 1 | awk '{print $1}'; }
+
+# Print the cached access token if a valid (non-expired) Fido SSO
+# session exists, else fail. The CLI may have written the cache under
+# either the sso-session-name hash or the start-url hash, so we scan
+# everything in the cache dir and match by startUrl.
+sso_cached_token() {
+    local cache_dir="${HOME}/.aws/sso/cache"
+    [ -d "$cache_dir" ] || return 1
+    python3 - "$cache_dir" "$FIDO_SSO_START_URL" <<'PY' 2>/dev/null
+import json, os, sys
+from datetime import datetime, timezone
+cache_dir, start_url = sys.argv[1:3]
+now = datetime.now(timezone.utc)
+for f in sorted(os.listdir(cache_dir)):
+    if not f.endswith('.json'): continue
+    try:
+        with open(os.path.join(cache_dir, f)) as fh: d = json.load(fh)
+    except Exception:
+        continue
+    if d.get('startUrl') != start_url: continue
+    expires = (d.get('expiresAt') or '').replace('Z', '+00:00')
+    try:
+        if datetime.fromisoformat(expires) > now and d.get('accessToken'):
+            print(d['accessToken']); sys.exit(0)
+    except Exception:
+        continue
+sys.exit(1)
+PY
+}
+
+# Run the SSO OIDC device-authorization flow against Fido's IdC. On
+# success, prints the access token, writes ~/.aws/sso/cache/<sha1>.json
+# in AWS-CLI-compatible format, and returns 0.
+sso_oidc_login() {
+    local cache_dir="${HOME}/.aws/sso/cache"
+    mkdir -p "$cache_dir"
+    chmod 700 "${HOME}/.aws" "${HOME}/.aws/sso" "$cache_dir" 2>/dev/null || true
+
+    info "Registering OIDC client..."
+    local resp client_id client_secret
+    if ! resp=$(curl -fsS -X POST "${SSO_OIDC_URL}/client/register" \
+        -H 'Content-Type: application/json' \
+        -d '{"clientName":"fido-installer","clientType":"public","scopes":["sso:account:access"]}'); then
+        fail "OIDC client registration failed (network or AWS endpoint problem)"
+        return 1
+    fi
+    client_id=$(json_field "$resp" clientId)
+    client_secret=$(json_field "$resp" clientSecret)
+    [ -n "$client_id" ] && [ -n "$client_secret" ] || { fail "OIDC register: bad response"; return 1; }
+
+    info "Starting device authorization..."
+    local body device_code verification_uri user_code interval expires_in
+    body=$(printf '{"clientId":"%s","clientSecret":"%s","startUrl":"%s"}' \
+        "$client_id" "$client_secret" "$FIDO_SSO_START_URL")
+    if ! resp=$(curl -fsS -X POST "${SSO_OIDC_URL}/device_authorization" \
+        -H 'Content-Type: application/json' -d "$body"); then
+        fail "Device authorization request failed"
+        return 1
+    fi
+    device_code=$(json_field "$resp" deviceCode)
+    verification_uri=$(json_field "$resp" verificationUriComplete)
+    user_code=$(json_field "$resp" userCode)
+    interval=$(json_field "$resp" interval); interval="${interval:-5}"
+    expires_in=$(json_field "$resp" expiresIn); expires_in="${expires_in:-600}"
+    [ -n "$device_code" ] && [ -n "$verification_uri" ] || { fail "Bad device_authorization response"; return 1; }
+
     echo ""
-    fail "Couldn't establish working AWS credentials."
-    [ -n "${aws_caller_output:-}" ] && fail "Details: ${aws_caller_output}"
+    info "Opening Fido SSO in your browser..."
+    info "Verification code: ${BOLD}${user_code}${NC}"
+    info "If the browser doesn't open: ${BOLD}${verification_uri}${NC}"
+    open "$verification_uri" 2>/dev/null || true
+    echo ""
+    info "Waiting for you to approve in the browser (up to $((expires_in/60))min)..."
+
+    # Poll /token until the user finishes the browser flow. While the
+    # user is still authenticating, /token returns HTTP 400 with
+    # {"error":"authorization_pending"}; we don't use -f so we can read
+    # the error JSON. AWS uses "slow_down" to ask us to back off.
+    local token_body deadline now access_token expires_in_token err
+    token_body=$(printf '{"clientId":"%s","clientSecret":"%s","grantType":"urn:ietf:params:oauth:grant-type:device_code","deviceCode":"%s"}' \
+        "$client_id" "$client_secret" "$device_code")
+    deadline=$(($(date +%s) + expires_in))
+    while :; do
+        now=$(date +%s)
+        [ "$now" -ge "$deadline" ] && { fail "Timed out waiting for browser sign-in"; return 1; }
+        resp=$(curl -sS -X POST "${SSO_OIDC_URL}/token" \
+            -H 'Content-Type: application/json' -d "$token_body" 2>/dev/null || true)
+        access_token=$(json_field "$resp" accessToken)
+        if [ -n "$access_token" ]; then
+            expires_in_token=$(json_field "$resp" expiresIn); expires_in_token="${expires_in_token:-28800}"
+            break
+        fi
+        err=$(json_field "$resp" error)
+        case "$err" in
+            authorization_pending) ;;
+            slow_down)             interval=$((interval + 5)) ;;
+            '')                    warn "Empty response from /token — retrying" ;;
+            *)                     fail "Sign-in failed (${err})"; return 1 ;;
+        esac
+        sleep "$interval"
+    done
+
+    # Write the cache file. Modern AWS CLI (v2.9+) uses sha1 of the
+    # sso-session name; legacy CLI uses sha1 of the start URL. Write
+    # under both so any CLI version finds it.
+    local key1 key2 expires_at
+    key1=$(sha1_hex "$FIDO_SSO_NAME")
+    key2=$(sha1_hex "$FIDO_SSO_START_URL")
+    expires_at=$(python3 -c "from datetime import datetime,timezone,timedelta;print((datetime.now(timezone.utc)+timedelta(seconds=int($expires_in_token))).strftime('%Y-%m-%dT%H:%M:%SZ'))")
+    if ! python3 - "$cache_dir" "$key1" "$key2" "$FIDO_SSO_START_URL" "$FIDO_SSO_REGION" "$access_token" "$expires_at" "$client_id" "$client_secret" <<'PY'; then
+import json, os, sys, tempfile
+cache_dir, key1, key2, start_url, region, token, expires_at, client_id, client_secret = sys.argv[1:10]
+data = {
+    'startUrl':     start_url,
+    'region':       region,
+    'accessToken':  token,
+    'expiresAt':    expires_at,
+    'clientId':     client_id,
+    'clientSecret': client_secret,
+}
+for key in {key1, key2}:
+    path = os.path.join(cache_dir, f'{key}.json')
+    fd, tmp = tempfile.mkstemp(prefix='.cp.', dir=cache_dir)
+    with os.fdopen(fd, 'w') as f: json.dump(data, f)
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, path)
+PY
+        fail "Couldn't write SSO cache file"
+        return 1
+    fi
+
+    echo "$access_token"
+    return 0
+}
+
+# Validate the token by listing accounts. Prints the account count on
+# stdout, returns 0 if ≥1 account, 1 otherwise (or on HTTP failure).
+sso_list_accounts() {
+    local token="$1" resp
+    resp=$(curl -fsS -H "x-amz-sso_bearer_token: ${token}" \
+        "${SSO_PORTAL_URL}/federation/list-accounts?max_result=100") || return 1
+    python3 -c '
+import json, sys
+n = len(json.load(sys.stdin).get("accountList", []))
+print(n); sys.exit(0 if n > 0 else 1)
+' <<<"$resp"
+}
+
+# Have the user pick an (account, role). On success prints
+# "<account_id>\t<account_name>\t<role_name>" and returns 0.
+sso_pick_account_role() {
+    local token="$1" accounts roles lines role_lines picked role
+    accounts=$(curl -fsS -H "x-amz-sso_bearer_token: ${token}" \
+        "${SSO_PORTAL_URL}/federation/list-accounts?max_result=100") || return 1
+    lines=$(python3 -c '
+import json, sys
+for a in json.load(sys.stdin).get("accountList", []):
+    print(f"{a[\"accountId\"]}\t{a[\"accountName\"]}")
+' <<<"$accounts")
+    [ -n "$lines" ] || return 1
+
+    if [ "$(printf '%s\n' "$lines" | grep -c .)" = "1" ]; then
+        picked="$lines"
+    else
+        picked=$(printf '%s\n' "$lines" | fzf --height=50% --reverse --border --no-multi \
+            --delimiter=$'\t' --with-nth=2 \
+            --prompt="Pick an AWS account > " \
+            --header="↑↓ to move, Enter to select")
+    fi
+    [ -z "$picked" ] && return 1
+
+    local account_id account_name
+    account_id=$(awk -F'\t' '{print $1}' <<<"$picked")
+    account_name=$(awk -F'\t' '{print $2}' <<<"$picked")
+
+    roles=$(curl -fsS -H "x-amz-sso_bearer_token: ${token}" \
+        "${SSO_PORTAL_URL}/federation/list-account-roles?account_id=${account_id}&max_result=100") || return 1
+    role_lines=$(python3 -c '
+import json, sys
+for r in json.load(sys.stdin).get("roleList", []):
+    print(r["roleName"])
+' <<<"$roles")
+    [ -n "$role_lines" ] || return 1
+
+    if [ "$(printf '%s\n' "$role_lines" | grep -c .)" = "1" ]; then
+        role="$role_lines"
+    else
+        role=$(printf '%s\n' "$role_lines" | fzf --height=40% --reverse --border --no-multi \
+            --prompt="Pick a role > " --header="↑↓ to move, Enter to select")
+    fi
+    [ -z "$role" ] && return 1
+
+    printf '%s\t%s\t%s\n' "$account_id" "$account_name" "$role"
+}
+
+# Add/update [sso-session fido] + [profile fido] in ~/.aws/config.
+# Uses configparser so existing sections (other profiles, sessions)
+# are preserved verbatim.
+sso_write_config() {
+    local account_id="$1" role_name="$2"
+    local cfg="${AWS_CONFIG_FILE:-${HOME}/.aws/config}"
+    mkdir -p "$(dirname "$cfg")"
+    chmod 700 "$(dirname "$cfg")" 2>/dev/null || true
+
+    python3 - "$cfg" "$FIDO_SSO_NAME" "$FIDO_SSO_START_URL" "$FIDO_SSO_REGION" "$account_id" "$role_name" <<'PY' || return 1
+import configparser, os, sys, tempfile
+cfg_path, session_name, start_url, region, account_id, role_name = sys.argv[1:7]
+parser = configparser.RawConfigParser()
+parser.optionxform = str   # preserve key case
+if os.path.exists(cfg_path):
+    parser.read(cfg_path)
+
+ssec, psec = f'sso-session {session_name}', f'profile {session_name}'
+if not parser.has_section(ssec): parser.add_section(ssec)
+parser.set(ssec, 'sso_start_url',           start_url)
+parser.set(ssec, 'sso_region',              region)
+parser.set(ssec, 'sso_registration_scopes', 'sso:account:access')
+
+if not parser.has_section(psec): parser.add_section(psec)
+parser.set(psec, 'sso_session',    session_name)
+parser.set(psec, 'sso_account_id', account_id)
+parser.set(psec, 'sso_role_name',  role_name)
+parser.set(psec, 'region',         region)
+parser.set(psec, 'output',         'json')
+
+dirn = os.path.dirname(cfg_path) or '.'
+fd, tmp = tempfile.mkstemp(prefix='.cp.', dir=dirn)
+with os.fdopen(fd, 'w') as f: parser.write(f)
+os.chmod(tmp, 0o600)
+os.replace(tmp, cfg_path)
+PY
+}
+
+# Top-level: ensure the user has working Fido SSO access. Cached
+# session short-circuits; otherwise run the device flow and (for new
+# users) write a default profile.
+ensure_fido_sso() {
+    local token n cfg picked account_id account_name role_name
+
+    if token=$(sso_cached_token); then
+        success "Active Fido SSO session found"
+        export AWS_PROFILE="${AWS_PROFILE:-${FIDO_SSO_NAME}}"
+        return 0
+    fi
+
+    [ -t 0 ] || {
+        fail "No active Fido SSO session and stdin isn't a terminal — can't run the device flow."
+        return 1
+    }
+
+    info "Starting Fido AWS SSO sign-in (no AWS CLI required)..."
+    token=$(sso_oidc_login) || return 1
+
+    info "Validating Fido AWS account access..."
+    if ! n=$(sso_list_accounts "$token"); then
+        fail "Sign-in succeeded but no AWS accounts are assigned to your Fido SSO user."
+        return 1
+    fi
+    success "Fido SSO sign-in succeeded — ${BOLD}${n}${NC} account(s) available"
+
+    cfg="${AWS_CONFIG_FILE:-${HOME}/.aws/config}"
+    if [ ! -s "$cfg" ] || ! grep -q 'fido\.awsapps\.com/start' "$cfg" 2>/dev/null; then
+        info "Picking a default AWS account+role for the ${BOLD}${FIDO_SSO_NAME}${NC} profile..."
+        if picked=$(sso_pick_account_role "$token"); then
+            account_id=$(awk -F'\t' '{print $1}' <<<"$picked")
+            account_name=$(awk -F'\t' '{print $2}' <<<"$picked")
+            role_name=$(awk -F'\t' '{print $3}' <<<"$picked")
+            if sso_write_config "$account_id" "$role_name"; then
+                success "Wrote profile ${BOLD}${FIDO_SSO_NAME}${NC} → ${account_name} (${role_name})"
+                info "To make this your default, add ${BOLD}export AWS_PROFILE=${FIDO_SSO_NAME}${NC} to your shell rc."
+            else
+                warn "Couldn't write ~/.aws/config — run \`aws configure sso\` later if you want a CLI profile."
+            fi
+        else
+            warn "Skipped account/role picker — run \`aws configure sso\` later if you want a CLI profile."
+        fi
+    else
+        success "Fido SSO already in ~/.aws/config — refreshed session cache"
+    fi
+
+    export AWS_PROFILE="${AWS_PROFILE:-${FIDO_SSO_NAME}}"
+    return 0
+}
+
+# Validate Fido SSO access first (cheap, no sudo). If the user has no
+# Fido AWS account we can fail before prompting for a Mac password.
+if ! ensure_fido_sso; then
+    echo ""
+    fail "Couldn't establish Fido AWS SSO access."
     echo ""
     info "${BOLD}Don't have a Fido AWS account yet?${NC}"
     info "  Ping ${BOLD}#eng-platform${NC} on Slack to request one."
     info "  Once it's created, re-run this installer."
     echo ""
-    info "${BOLD}SSO login failed (browser/auth error)?${NC}"
-    info "  Re-run ${BOLD}aws configure sso${NC} manually, then re-run this installer."
+    info "${BOLD}Browser sign-in failed or timed out?${NC}"
+    info "  Re-run this installer and complete the SSO step in your browser."
     echo ""
-    info "${BOLD}Already configured under a different profile?${NC}"
-    info "  Run ${BOLD}export AWS_PROFILE=<your-profile-name>${NC} before rerunning,"
-    info "  or ${BOLD}aws sso login --profile <your-profile-name>${NC} to refresh."
-    echo ""
-    fail "Aborting installer — re-run once AWS access is set up."
+    fail "Aborting installer — re-run once SSO sign-in succeeds."
+    exit 1
+fi
+
+# Install the AWS CLI for downstream use. The OIDC cache we just wrote
+# is in the same format the CLI expects, so the user's first `aws`
+# command inherits the live session — no second login.
+if ! ensure_aws_cli; then
     exit 1
 fi
 
