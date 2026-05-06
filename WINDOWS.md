@@ -20,7 +20,7 @@ for DNS instead of Homebrew + `/etc/resolver/`.
 Open PowerShell **as Administrator**, then:
 
 ```powershell
-iex (irm https://raw.githubusercontent.com/FidoMoney/fido-agent-installer/main/install.ps1)
+iex (irm https://raw.githubusercontent.com/FidoMoney/fido-installer/main/install.ps1)
 ```
 
 That single line:
@@ -138,7 +138,7 @@ Profiles → Add Profile`, point at `~\Documents\fido-vpn.ovpn`.
   that command runs. Claude CLI limitation.
 - The `.ovpn` profile lands in `~\Documents\fido-vpn.ovpn`.
 - The script is downloaded over HTTPS from GitHub. Inspect first if you'd
-  rather: `irm https://raw.githubusercontent.com/FidoMoney/fido-agent-installer/main/install.ps1 | more`.
+  rather: `irm https://raw.githubusercontent.com/FidoMoney/fido-installer/main/install.ps1 | more`.
 
 ## Reporting issues
 

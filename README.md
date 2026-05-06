@@ -1,4 +1,4 @@
-# Fido Agent Installer
+# Fido Installer
 
 One-shot installer for Fido engineering tooling. Run it on a fresh Mac and you get:
 
@@ -25,7 +25,7 @@ You'll need:
 Then run:
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/FidoMoney/fido-agent-installer/main/install.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/FidoMoney/fido-installer/main/install.sh)
 ```
 
 The script will walk you through:
@@ -58,7 +58,7 @@ cd ~/fido-money && claude
 | Install somewhere other than `$HOME` | `FIDO_INSTALL_DIR=~/work bash <(curl -fsSL …/install.sh)`                                                 |
 | Dry run (show what it would do)      | `bash <(curl -fsSL …/install.sh) --mcp-only --dry-run`                                                    |
 
-(Replace `…/install.sh` with the full URL — `https://raw.githubusercontent.com/FidoMoney/fido-agent-installer/main/install.sh`.)
+(Replace `…/install.sh` with the full URL — `https://raw.githubusercontent.com/FidoMoney/fido-installer/main/install.sh`.)
 
 ## What lives where
 
@@ -90,7 +90,7 @@ Skip with `--skip-dns` if you've configured DNS another way.
 - The MCP bearer token is read from `--token`, `FIDO_MCP_TOKEN`, or a hidden prompt — never logged or written to disk by this script.
 - The token is passed to `claude mcp add` via an `Authorization` header argument, so it is briefly visible in `ps aux` while that command runs. Claude CLI limitation, not specific to this installer.
 - The VPN profile you paste/import is written to `~/Documents/fido-vpn.ovpn` (mode `0644` — readable only by your user).
-- This script is downloaded over HTTPS from GitHub. Inspect it first if you'd rather: `curl -fsSL https://raw.githubusercontent.com/FidoMoney/fido-agent-installer/main/install.sh | less`.
+- This script is downloaded over HTTPS from GitHub. Inspect it first if you'd rather: `curl -fsSL https://raw.githubusercontent.com/FidoMoney/fido-installer/main/install.sh | less`.
 
 ## Troubleshooting
 
