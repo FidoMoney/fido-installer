@@ -90,6 +90,39 @@ function Refresh-Path {
 
 function Has-Cmd { param([string]$Name) [bool](Get-Command $Name -ErrorAction SilentlyContinue) }
 
+# Run `gh repo clone $Remote $Dest` with an animated spinner so the user can
+# see progress instead of staring at a frozen "Cloning…" line. Returns gh's
+# exit code.
+function Invoke-CloneWithSpinner {
+    param(
+        [Parameter(Mandatory)] [string]$Label,
+        [Parameter(Mandatory)] [string]$Remote,
+        [Parameter(Mandatory)] [string]$Dest
+    )
+    $frames = @('|', '/', '-', '\')
+    $job = Start-Job -ScriptBlock {
+        param($r, $d)
+        & gh repo clone $r $d -- --quiet *> $null
+        return $LASTEXITCODE
+    } -ArgumentList $Remote, $Dest
+    $i = 0
+    while ($job.State -eq 'Running') {
+        Write-Host -NoNewline ("`r  {0} Cloning {1}..." -f $frames[$i % $frames.Count], $Label)
+        Start-Sleep -Milliseconds 120
+        $i++
+    }
+    $rc = [int]((Receive-Job $job) | Select-Object -Last 1)
+    Remove-Job $job | Out-Null
+    if ($rc -eq 0) {
+        Write-Host -NoNewline ("`r  + Cloning {0}... " -f $Label)
+        Write-Host "done    " -ForegroundColor Green
+    } else {
+        Write-Host -NoNewline ("`r  X Cloning {0}... " -f $Label)
+        Write-Host "failed  " -ForegroundColor Red
+    }
+    return $rc
+}
+
 # Reliable "is the user actually at a TTY?" check. [Environment]::UserInteractive
 # returns $true under VS Code, PS ISE, scheduled tasks, and SYSTEM contexts —
 # not what we want. [Console]::IsInputRedirected being $false means stdin is
@@ -978,13 +1011,10 @@ if (-not $McpOnly) {
             Write-OK "fido-agent updated"
         } finally { Pop-Location }
     } else {
-        Write-Host -NoNewline "  Cloning fido-agent... "
-        & gh repo clone "$ORG/fido-agent" $AgentRepoDir -- --quiet 2>$null
-        if ($LASTEXITCODE -eq 0) {
-            Write-Host "done" -ForegroundColor Green
+        $rc = Invoke-CloneWithSpinner -Label 'fido-agent' -Remote "$ORG/fido-agent" -Dest $AgentRepoDir
+        if ($rc -eq 0) {
             Write-OK "fido-agent cloned"
         } else {
-            Write-Host "failed" -ForegroundColor Red
             Write-Fail "Could not clone fido-agent — check your access permissions"
             exit 1
         }
@@ -1017,15 +1047,8 @@ if (-not $McpOnly) {
     foreach ($r in $repos) {
         $dest = Join-Path $RomanDir $r
         if (Test-Path (Join-Path $dest '.git')) { $Skipped++; continue }
-        Write-Host -NoNewline "  Cloning $r... "
-        & gh repo clone "$ORG/$r" $dest -- --quiet 2>$null
-        if ($LASTEXITCODE -eq 0) {
-            Write-Host "done" -ForegroundColor Green
-            $Cloned++
-        } else {
-            Write-Host "failed" -ForegroundColor Red
-            $CloneFailed++
-        }
+        $rc = Invoke-CloneWithSpinner -Label $r -Remote "$ORG/$r" -Dest $dest
+        if ($rc -eq 0) { $Cloned++ } else { $CloneFailed++ }
     }
     if ($Cloned -gt 0)      { Write-OK   "Cloned $Cloned new repositories" }
     if ($Skipped -gt 0)     { Write-Info "$Skipped repositories already exist locally" }
@@ -1220,8 +1243,8 @@ if (-not $McpOnly) {
             if ($parent -and -not (Test-Path $parent)) {
                 New-Item -ItemType Directory -Path $parent -Force | Out-Null
             }
-            & gh repo clone "$ORG/skills" $skillsRepoDir -- --quiet 2>$null
-            if ($LASTEXITCODE -eq 0) { Write-OK "Skills cloned to $skillsRepoDir" }
+            $rc = Invoke-CloneWithSpinner -Label 'skills' -Remote "$ORG/skills" -Dest $skillsRepoDir
+            if ($rc -eq 0) { Write-OK "Skills cloned to $skillsRepoDir" }
             else { Write-Warn2 "Could not clone $ORG/skills — check your access permissions" }
         }
     } else {

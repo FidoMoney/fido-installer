@@ -97,6 +97,30 @@ success() { echo -e "${GREEN}✔${NC}  $1" >&2; }
 warn()    { echo -e "${YELLOW}⚠${NC}  $1" >&2; }
 fail()    { echo -e "${RED}✖${NC}  $1" >&2; }
 
+# Run `gh repo clone $remote $dest` with an animated braille spinner so the
+# user can see progress instead of staring at a frozen "Cloning…" line.
+# Returns gh's exit status.
+clone_with_spinner() {
+    local label="$1" remote="$2" dest="$3"
+    local frames=('⠋' '⠙' '⠹' '⠸' '⠼' '⠴' '⠦' '⠧' '⠇' '⠏')
+    local nframes=${#frames[@]}
+    local i=0 rc=0
+    gh repo clone "$remote" "$dest" -- --quiet >/dev/null 2>&1 &
+    local pid=$!
+    while kill -0 "$pid" 2>/dev/null; do
+        printf "\r  ${BLUE}%s${NC} Cloning %s..." "${frames[i % nframes]}" "$label"
+        i=$((i + 1))
+        sleep 0.1
+    done
+    wait "$pid" || rc=$?
+    if [ "$rc" -eq 0 ]; then
+        printf "\r  ${GREEN}✔${NC} Cloning %s... ${GREEN}done${NC}    \n" "$label"
+    else
+        printf "\r  ${RED}✖${NC} Cloning %s... ${RED}failed${NC}  \n" "$label"
+    fi
+    return $rc
+}
+
 # Single-select picker via fzf. Echoes the chosen line, or empty on cancel.
 # Lines are passed as args. Caller decides how to interpret the result.
 fzf_pick() {
@@ -926,12 +950,9 @@ if [ -d "${AGENT_REPO_DIR}/.git" ]; then
     cd "$SCRIPT_DIR"
     success "fido-agent updated"
 else
-    echo -n "  Cloning fido-agent... "
-    if gh repo clone "${ORG}/fido-agent" "$AGENT_REPO_DIR" -- --quiet 2>/dev/null; then
-        echo -e "${GREEN}done${NC}"
+    if clone_with_spinner "fido-agent" "${ORG}/fido-agent" "$AGENT_REPO_DIR"; then
         success "fido-agent cloned"
     else
-        echo -e "${RED}failed${NC}"
         fail "Could not clone fido-agent — check your access permissions"
         exit 1
     fi
@@ -1005,15 +1026,10 @@ echo ""
 for repo in "${REPOS[@]}"; do
     if [ -d "${ROMAN_DIR}/${repo}/.git" ]; then
         SKIPPED=$((SKIPPED + 1))
+    elif clone_with_spinner "${repo}" "${ORG}/${repo}" "${ROMAN_DIR}/${repo}"; then
+        CLONED=$((CLONED + 1))
     else
-        echo -n "  Cloning ${repo}... "
-        if gh repo clone "${ORG}/${repo}" "${ROMAN_DIR}/${repo}" -- --quiet 2>/dev/null; then
-            echo -e "${GREEN}done${NC}"
-            CLONED=$((CLONED + 1))
-        else
-            echo -e "${RED}failed${NC}"
-            CLONE_FAILED=$((CLONE_FAILED + 1))
-        fi
+        CLONE_FAILED=$((CLONE_FAILED + 1))
     fi
 done
 
@@ -1235,7 +1251,7 @@ if [ -n "$SKILLS_REPO_DIR" ]; then
             || warn "Skills update failed"
     else
         mkdir -p "$(dirname "$SKILLS_REPO_DIR")"
-        if gh repo clone "${ORG}/skills" "$SKILLS_REPO_DIR" -- --quiet 2>/dev/null; then
+        if clone_with_spinner "skills" "${ORG}/skills" "$SKILLS_REPO_DIR"; then
             success "Skills cloned to ${BOLD}${SKILLS_REPO_DIR}${NC}"
         else
             warn "Could not clone ${ORG}/skills — check your access permissions"
