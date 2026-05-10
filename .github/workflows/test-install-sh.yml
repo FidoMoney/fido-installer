@@ -1,0 +1,143 @@
+name: test-install-sh
+
+# Two jobs:
+#   - lint: shellcheck on Linux. Catches syntax / common bugs without
+#     booting a macOS runner. Fast.
+#   - smoke-macos: real macOS runner. Verifies the script parses under
+#     bash 3.2 (the default macOS bash, where many bash 4+ features
+#     silently misbehave) and that the inline `--help` block + the
+#     fdsubst banner still render cleanly.
+#
+# Trigger via GitHub UI: Actions → test-install-sh → Run workflow.
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - 'install.sh'
+      - '.github/workflows/test-install-sh.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'install.sh'
+      - '.github/workflows/test-install-sh.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: Lint (shellcheck)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install shellcheck
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
+
+      - name: Show shellcheck version
+        run: shellcheck --version
+
+      # Fail on errors, surface warnings as GitHub annotations but don't
+      # block the build. Mirrors PSScriptAnalyzer's behavior in
+      # test-install-ps1.yml — same severity contract on both sides.
+      - name: Run shellcheck (fail on error, warn-only on warnings)
+        run: |
+          set +e
+          shellcheck --severity=error --format=tty install.sh
+          err_rc=$?
+          shellcheck --severity=warning --format=tty install.sh > sc-warn.txt
+          if [ -s sc-warn.txt ]; then
+            echo "::warning::shellcheck found warnings (non-fatal):"
+            cat sc-warn.txt
+          fi
+          exit "$err_rc"
+
+      - name: Bash parse check
+        run: bash -n install.sh
+
+  smoke-macos:
+    name: Smoke test (macos-latest, bash 3.2)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Show environment
+        run: |
+          /bin/bash --version | head -1
+          which gh git curl
+
+      # macOS ships /bin/bash 3.2 by default. Newer bashes from Homebrew
+      # mask 3.2-isms during local dev — exercise the system bash here
+      # so we catch them before laptops do.
+      - name: Bash parse check (system bash 3.2)
+        run: /bin/bash -n install.sh
+
+      # The --help output is sliced from a fixed line range
+      # (`sed -n '2,22p'` at the top of install.sh). A header rewrite
+      # would silently break --help — assert the slice still looks
+      # like help text.
+      - name: --help output still renders
+        run: |
+          out=$(/bin/bash install.sh --help 2>&1) || true
+          echo "$out"
+          echo "$out" | grep -q "Fido Agents Setup" || {
+            echo "::error::install.sh --help no longer surfaces the header banner"
+            exit 1
+          }
+          for flag in --mcp-only --skip-mcp --keep-local --yes; do
+            echo "$out" | grep -qF -- "$flag" || {
+              echo "::error::install.sh --help no longer documents $flag (slice range may be stale)"
+              exit 1
+            }
+          done
+
+      # Verify the helper functions parse and behave on a system that
+      # has none of the macOS-only deps (homebrew, AWS VPN Client, etc.)
+      # by source-loading just the side-effect-free pieces. This mirrors
+      # the dot-source smoke in test-install-ps1.yml and uses the same
+      # min-count gate so a silent rename can't shrink coverage.
+      - name: Dot-source helpers (no execution of main flow)
+        run: |
+          /bin/bash <<'BASH'
+          set -euo pipefail
+          # The list is the side-effect-free helpers we actually invoke
+          # in the smoke calls below. Bump $expected_min deliberately
+          # when adding/removing.
+          helpers=(info success warn fail fzf_pick vpn_is_up json_field sha1_hex)
+          expected_min=${#helpers[@]}
+          alt=$(IFS='|'; echo "${helpers[*]}")
+          # Extract `name() { ... }` blocks for the named helpers, brace-balanced.
+          # awk avoids the bash-3.2 regex-engine differences vs Linux bash 5.
+          extracted=$(awk -v names="$alt" '
+            BEGIN { split(names, nm, "|"); for (i in nm) want[nm[i]] = 1 }
+            /^[a-zA-Z_][a-zA-Z0-9_]*\(\)[[:space:]]*\{/ {
+              fn = $0; sub(/\(\).*/, "", fn)
+              if (fn in want) { capture = 1; depth = 0 }
+            }
+            capture {
+              print
+              # Count {} on the line so multi-line bodies close correctly.
+              n = gsub(/\{/, "{")
+              m = gsub(/\}/, "}")
+              depth += n - m
+              if (depth == 0 && /\}/) { capture = 0; print "" }
+            }
+          ' install.sh)
+          got=$(printf '%s\n' "$extracted" | grep -cE '^[a-zA-Z_][a-zA-Z0-9_]*\(\)' || true)
+          if [ "$got" -lt "$expected_min" ]; then
+            echo "::error::Expected >= $expected_min helpers, extracted $got. A helper was renamed/removed — update the name list."
+            exit 1
+          fi
+          # Stub colors so the helpers can echo without ANSI noise.
+          RED= GREEN= YELLOW= BLUE= BOLD= DIM= PINK= NC=
+          # shellcheck disable=SC2034
+          MCP_DNS_DOMAIN='global-private.fido.money'
+          eval "$extracted"
+          # Smoke the cheap, side-effect-free helpers.
+          [ "$(json_field '{"a":"b"}' a)" = "b" ] || { echo "json_field failed"; exit 1; }
+          [ -n "$(sha1_hex 'fido')" ] || { echo "sha1_hex failed"; exit 1; }
+          # vpn_is_up MUST return non-zero on a runner with no Fido VPN.
+          if vpn_is_up; then echo "vpn_is_up unexpectedly true on CI runner"; exit 1; fi
+          echo "Helpers loaded and smoke-tested OK"
+          BASH

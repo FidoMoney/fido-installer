@@ -57,6 +57,27 @@ cd ~/fido-money && claude
 | Pass the token non-interactively     | `FIDO_MCP_TOKEN=xxx bash <(curl -fsSL …/install.sh)`                                                      |
 | Install somewhere other than `$HOME` | `FIDO_INSTALL_DIR=~/work bash <(curl -fsSL …/install.sh)`                                                 |
 | Dry run (show what it would do)      | `bash <(curl -fsSL …/install.sh) --mcp-only --dry-run`                                                    |
+| Re-run without nuking local edits    | `bash <(curl -fsSL …/install.sh) --keep-local`                                                            |
+| Unattended (CI / scripted)           | `FIDO_MCP_TOKEN=xxx bash <(curl -fsSL …/install.sh) -y`                                                   |
+
+> **`--keep-local`**: by default, the per-team-repo update step does
+> `git reset --hard` + `git clean -fd` on every repo, **discarding any
+> uncommitted edits** with a warning. That's right for a fresh laptop;
+> it's brutal for re-runs as the documented update path. With
+> `--keep-local` (env: `FIDO_KEEP_LOCAL=1`) the installer still runs
+> `git fetch` everywhere, but **skips** the reset on any repo with a
+> dirty working tree — `git status` will show you you're behind origin
+> so you can rebase manually. The summary surfaces a "Kept (local edits)"
+> count.
+
+> **`-y` / `--yes`**: auto-accepts `[Y/n]` prompts. Two prompts
+> deliberately do **not** auto-accept under `--yes`: (1) the per-MCP
+> "overwrite existing" prompt — keeps the existing entry, mirroring the
+> non-tty default, so `--yes` can't silently rewrite a working config
+> with a wrong token; (2) the hidden token prompt — `--yes` runs
+> unattended, so the token must come from `--token` / `FIDO_MCP_TOKEN`
+> (the script fails fast if neither is set). The VPN-profile prompt is
+> also skipped under `--yes` (no safe default for "paste your config").
 
 (Replace `…/install.sh` with the full URL — `https://raw.githubusercontent.com/FidoMoney/fido-installer/main/install.sh`.)
 
@@ -91,6 +112,23 @@ Skip with `--skip-dns` if you've configured DNS another way.
 - The token is passed to `claude mcp add` via an `Authorization` header argument, so it is briefly visible in `ps aux` while that command runs. Claude CLI limitation, not specific to this installer.
 - The VPN profile you paste/import is written to `~/Documents/fido-vpn.ovpn` (mode `0644` — readable only by your user).
 - This script is downloaded over HTTPS from GitHub. Inspect it first if you'd rather: `curl -fsSL https://raw.githubusercontent.com/FidoMoney/fido-installer/main/install.sh | less`.
+
+### Third-party installers we pipe to bash
+
+This installer is itself piped to `bash`, and it in turn pipes a few
+upstream installers to `bash`/`installer(1)`. None are pinned by hash —
+we trust them by reference, not by checksum. Be aware of:
+
+| Source | What it does | How we invoke it |
+| --- | --- | --- |
+| `raw.githubusercontent.com/Homebrew/install/HEAD/install.sh` | Installs Homebrew | `curl … \| bash` |
+| `claude.ai/install.sh` | Installs the Claude Code CLI | `curl … \| bash` |
+| `awscli.amazonaws.com/AWSCLIV2.pkg` | Apple-signed AWS CLI v2 pkg | `sudo installer -pkg` |
+
+The trust chain therefore relies on (a) HTTPS to the upstream domain and
+(b) GitHub's release / Amazon's code signing on each side. If your
+threat model needs stronger guarantees, download `install.sh`, audit it,
+and run it from a local copy.
 
 ## Troubleshooting
 

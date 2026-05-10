@@ -14,10 +14,14 @@
     powershell -ExecutionPolicy Bypass -File .\install.ps1 -Token <T>      # supply token
     powershell -ExecutionPolicy Bypass -File .\install.ps1 -McpOnly -All   # all MCPs, no checklist
     powershell -ExecutionPolicy Bypass -File .\install.ps1 -SkipMcp        # skip MCP step
+    powershell -ExecutionPolicy Bypass -File .\install.ps1 -KeepLocal      # don't reset repos with uncommitted edits
+    powershell -ExecutionPolicy Bypass -File .\install.ps1 -AssumeYes      # auto-accept every [Y/n] prompt
 
   Environment:
     FIDO_MCP_TOKEN=<T>     same as -Token
     SKIP_MCP_INSTALL=1     same as -SkipMcp
+    FIDO_KEEP_LOCAL=1      same as -KeepLocal
+    FIDO_ASSUME_YES=1      same as -AssumeYes
     FIDO_INSTALL_DIR=<D>   where to put fido-agent\  (default: $HOME)
 
   Notes:
@@ -32,6 +36,9 @@ param(
     [switch]$All,
     [switch]$DryRun,
     [switch]$SkipDns,
+    [switch]$KeepLocal,
+    [Alias('y','Yes')]
+    [switch]$AssumeYes,
     [string]$Token,
     [string]$Only,
     [string]$InstallDir
@@ -41,6 +48,9 @@ $ErrorActionPreference = 'Stop'
 
 # ── Config ───────────────────────────────────────────────────
 $ORG            = 'FidoMoney'
+# INSTALLER_VERSION — keep in sync with install.sh. Surfaced under the
+# banner so support tickets can pin which revision a user actually ran.
+$INSTALLER_VERSION = '2026.05.10'
 $MCP_DNS_DOMAIN = 'global-private.fido.money'
 $MCP_DNS_ZONES  = @(
     @{ Zone = 'global-private.fido.money';  Server = '10.3.0.2'  }
@@ -55,7 +65,12 @@ $MCP_GITOPS_PATH = 'applications/mcp-servers'
 # Resolve flags / env
 if (-not $Token -and $env:FIDO_MCP_TOKEN) { $Token = $env:FIDO_MCP_TOKEN }
 if ($env:SKIP_MCP_INSTALL -eq '1')        { $SkipMcp = $true }
+if ($env:FIDO_KEEP_LOCAL  -eq '1')        { $KeepLocal = $true }
+if ($env:FIDO_ASSUME_YES  -eq '1')        { $AssumeYes = $true }
 if (-not $InstallDir -and $env:FIDO_INSTALL_DIR) { $InstallDir = $env:FIDO_INSTALL_DIR }
+
+# Counts repos kept due to -KeepLocal (surfaced in the summary).
+$script:KeptLocal = 0
 
 $McpMode = if ($All) { 'all' } elseif ($Only) { 'only' } else { 'interactive' }
 
@@ -140,7 +155,7 @@ function Print-Banner {
     Write-Host "${pink}  / /_  / / __  / __ \    / // __ \/ ___/ __/ __ ``/ / / _ \/ ___/${rst}"
     Write-Host "${pink} / __/ / / /_/ / /_/ /  _/ // / / (__  ) /_/ /_/ / / /  __/ /    ${rst}"
     Write-Host "${pink}/_/   /_/\__,_/\____/  /___/_/ /_/____/\__/\__,_/_/_/\___/_/     ${rst}"
-    Write-Host "                                                  by platform team" -ForegroundColor DarkGray
+    Write-Host "                                       by platform team · v$INSTALLER_VERSION" -ForegroundColor DarkGray
     Write-Host ""
 }
 
@@ -260,7 +275,7 @@ Write-Host ""
 # Upfront preamble — what's about to happen, and what touches the system,
 # so the user has a chance to bail before sudo/network calls. Skipped in
 # -McpOnly mode (smaller scope) and in non-interactive runs.
-if (-not $McpOnly -and (Test-Interactive)) {
+if (-not $McpOnly -and (Test-Interactive) -and -not $AssumeYes) {
     Write-Host "This installer will:" -ForegroundColor White
     Write-Host "  - Install winget packages: git, gh, fzf, Node.js, AWS VPN Client"
     Write-Host "  - Install AWS CLI (winget, with fallback to Amazon's official MSI)"
@@ -876,7 +891,10 @@ if (-not $McpOnly) {
         Write-Host ""
         Write-Info "AWS VPN Client needs a Fido profile (.ovpn file) to connect."
 
-        if ((Test-Interactive)) {
+        # -AssumeYes has no safe default for the VPN profile (the user has
+        # to paste config or supply a path). Skip the prompt the same way
+        # the non-tty branch below does.
+        if ((Test-Interactive) -and -not $AssumeYes) {
             $choice = Select-One -Prompt "AWS VPN profile" -Items @(
                 "Paste config (.ovpn content) — finish with a blank line",
                 "Provide a path to a .ovpn file",
@@ -1002,11 +1020,16 @@ if (-not $McpOnly) {
             if ($defaultBranch) {
                 & git checkout $defaultBranch --quiet 2>$null
                 $dirty = (& git status --porcelain 2>$null)
-                if ($dirty) {
-                    $changedCount = ($dirty -split "`n" | Where-Object { $_ }).Count
-                    Write-Warn2 "fido-agent — discarding uncommitted local changes ($changedCount file(s))"
+                if ($dirty -and $KeepLocal) {
+                    Write-Warn2 "fido-agent — uncommitted changes; -KeepLocal set, leaving as-is"
+                    $script:KeptLocal++
+                } else {
+                    if ($dirty) {
+                        $changedCount = ($dirty -split "`n" | Where-Object { $_ }).Count
+                        Write-Warn2 "fido-agent — discarding uncommitted local changes ($changedCount file(s))"
+                    }
+                    & git reset --hard "origin/$defaultBranch" --quiet 2>$null
                 }
-                & git reset --hard "origin/$defaultBranch" --quiet 2>$null
             }
             Write-OK "fido-agent updated"
         } finally { Pop-Location }
@@ -1097,6 +1120,14 @@ if (-not $McpOnly) {
             $dirty   = (& git status --porcelain 2>$null)
             if ($dirty) {
                 $changedCount = ($dirty -split "`n" | Where-Object { $_ }).Count
+                if ($KeepLocal) {
+                    # -KeepLocal: warn but DON'T reset/clean. We still ran
+                    # `git fetch` earlier so `git status` will show the
+                    # user they're behind origin — they can rebase manually.
+                    Write-Warn2 "$($_.Name) — uncommitted changes; -KeepLocal set, leaving as-is ($changedCount file(s))"
+                    $script:KeptLocal++
+                    return
+                }
                 Write-Warn2 "$($_.Name) — discarding uncommitted local changes ($changedCount file(s))"
                 & git reset --hard HEAD --quiet 2>$null
                 & git clean -fd --quiet 2>$null
@@ -1210,7 +1241,7 @@ if (-not $McpOnly) {
     $colocatedSkillsDir = Join-Path $HOME 'fido-money\skills-repo'
     $skillsRepoDir = ''
 
-    if ((Test-Interactive)) {
+    if ((Test-Interactive) -and -not $AssumeYes) {
         $items = @(
             "$defaultSkillsDir   (user-scope, picked up by every Claude session)",
             "$colocatedSkillsDir   (colocated with the install)",
@@ -1257,9 +1288,10 @@ if (-not $McpOnly) {
     Write-Host "   Setup Complete"                                   -ForegroundColor White
     Write-Host "==================================================" -ForegroundColor White
     Write-Host ""
-    if ($Cloned -gt 0)       { Write-OK   "New repos cloned:   $Cloned" }
+    if ($Cloned -gt 0)        { Write-OK   "New repos cloned:   $Cloned" }
     Write-OK   "Repos up to date:   $Updated"
-    if ($UpdateFailed -gt 0) { Write-Warn2 "Need attention:     $UpdateFailed" }
+    if ($script:KeptLocal -gt 0) { Write-Warn2 "Kept (local edits): $script:KeptLocal (-KeepLocal; rebase manually)" }
+    if ($UpdateFailed -gt 0)  { Write-Warn2 "Need attention:     $UpdateFailed" }
     if ($CloneFailed  -gt 0) { Write-Warn2 "Clone failures:     $CloneFailed (check access permissions)" }
     Write-Host ""
     Write-OK "Agents are at:     $fidoMoneyLink"
@@ -1316,7 +1348,7 @@ Write-Info "MCP servers let Claude Code query Fido's data from the cluster."
 Write-Info "You'll need: VPN ON and the Fido MCP bearer token (ask in #eng-platform)."
 Write-Host ""
 
-if (-not $McpOnly -and (Test-Interactive)) {
+if (-not $McpOnly -and (Test-Interactive) -and -not $AssumeYes) {
     $reply = Read-Host "  Install MCP servers now? [Y/n]"
     if ([string]::IsNullOrEmpty($reply)) { $reply = 'Y' }
     if ($reply -notmatch '^(y|Y|yes|YES)$') {
@@ -1350,7 +1382,13 @@ if (-not $catalog -or $catalog.Count -eq 0) {
 Write-OK "Found $($catalog.Count) MCP servers"
 Write-Host ""
 
-if ($McpMode -eq 'interactive' -and (Test-Interactive)) {
+# -AssumeYes promotes interactive mode to 'all' without prompting. Explicit
+# -All / -Only still take precedence because they pin $McpMode before this
+# gate runs.
+if ($McpMode -eq 'interactive' -and $AssumeYes) {
+    $McpMode = 'all'
+    Write-Info "Installing all MCPs (-AssumeYes implies install-all default)..."
+} elseif ($McpMode -eq 'interactive' -and (Test-Interactive)) {
     Write-Host "Quick option: install all $($catalog.Count) MCP servers in one shot." -ForegroundColor White
     Write-Host "  - Press Y (or Enter) to install everything" -ForegroundColor DarkGray
     Write-Host "  - Press N to pick servers from a list"      -ForegroundColor DarkGray
@@ -1359,9 +1397,11 @@ if ($McpMode -eq 'interactive' -and (Test-Interactive)) {
     Write-Host ""
 }
 
-# Token — flag / env / hidden prompt.
+# Token — flag / env / hidden prompt. Under -AssumeYes we deliberately do
+# NOT prompt (-AssumeYes is for unattended runs; the token must come from
+# -Token / env). The fail-fast block below catches the missing-token case.
 if (-not $Token) {
-    if ((Test-Interactive)) {
+    if ((Test-Interactive) -and -not $AssumeYes) {
         Write-Info "Paste the Fido MCP bearer token (input hidden):"
         $secure = Read-Host -AsSecureString "  >"
         $Token = [System.Net.NetworkCredential]::new('', $secure).Password
@@ -1463,8 +1503,11 @@ foreach ($name in $selected) {
     $url = "http://$name-mcp.$MCP_DNS_DOMAIN/mcp"
 
     if ($existingNames -contains $name) {
+        # -AssumeYes intentionally does NOT auto-overwrite — that would let
+        # -AssumeYes silently rewrite a working user's MCP config with a
+        # possibly-wrong token. Treat -AssumeYes the same as no-tty: keep.
         $decision = 'no'
-        if ((Test-Interactive)) {
+        if ((Test-Interactive) -and -not $AssumeYes) {
             $reply = Read-Host "  ? $name already configured. Overwrite? [y/N]"
             if ($reply -match '^(y|Y|yes|YES)$') { $decision = 'yes' }
         }

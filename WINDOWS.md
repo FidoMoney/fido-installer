@@ -54,6 +54,23 @@ claude
 | Pass the token non-interactively    | `$env:FIDO_MCP_TOKEN = "xxx"; .\install.ps1`                             |
 | Install somewhere other than `$HOME`| `$env:FIDO_INSTALL_DIR = "C:\work"; .\install.ps1`                       |
 | Dry run                             | `.\install.ps1 -McpOnly -DryRun`                                         |
+| Re-run without nuking local edits   | `.\install.ps1 -KeepLocal`                                               |
+| Unattended (CI / scripted)          | `$env:FIDO_MCP_TOKEN = "xxx"; .\install.ps1 -AssumeYes`                  |
+
+> **`-KeepLocal`**: by default, the per-team-repo update step does
+> `git reset --hard` + `git clean -fd` on every repo, **discarding any
+> uncommitted edits** with a warning. With `-KeepLocal` (env:
+> `FIDO_KEEP_LOCAL=1`) the installer still runs `git fetch`, but
+> **skips** the reset on any repo with a dirty working tree. The
+> summary surfaces a "Kept (local edits)" count. `-y` is an alias for
+> `-AssumeYes` (matches Linux convention).
+
+> **`-AssumeYes`**: auto-accepts `[Y/n]` prompts. Two prompts
+> deliberately do **not** auto-accept: (1) per-MCP "overwrite existing"
+> stays "no" — keeps the existing entry; (2) hidden token prompt is
+> skipped — the token must come from `-Token` / `$env:FIDO_MCP_TOKEN`,
+> otherwise the script fails fast. The VPN-profile prompt is also
+> skipped (no safe default for "paste your config").
 
 > Piped form (`iex (irm …)`) doesn't accept positional flags. Download
 > `install.ps1` first and run it with the parameters above.
@@ -139,6 +156,21 @@ Profiles → Add Profile`, point at `~\Documents\fido-vpn.ovpn`.
 - The `.ovpn` profile lands in `~\Documents\fido-vpn.ovpn`.
 - The script is downloaded over HTTPS from GitHub. Inspect first if you'd
   rather: `irm https://raw.githubusercontent.com/FidoMoney/fido-installer/main/install.ps1 | more`.
+
+### Third-party installers we invoke
+
+This installer is itself piped to `iex`, and it in turn calls a few
+upstream installers. None are pinned by hash — we trust them by
+reference (HTTPS + winget signing). Be aware of:
+
+| Source | What it does | How we invoke it |
+| --- | --- | --- |
+| `winget` packages: `Git.Git`, `GitHub.cli`, `junegunn.fzf`, `OpenJS.NodeJS`, `Amazon.AWSCLI`, `Amazon.AWSVPNClient` | Dev tools | `winget install --id <id> -e` |
+| `awscli.amazonaws.com/AWSCLIV2.msi` | AWS CLI fallback when winget fails | `msiexec /i` |
+| `claude.ai/install.ps1` (or equivalent) | Claude Code CLI | piped to PowerShell |
+
+If your threat model needs stronger guarantees, download `install.ps1`,
+audit it, and run it from a local copy.
 
 ## Reporting issues
 

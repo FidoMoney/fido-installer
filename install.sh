@@ -14,10 +14,14 @@
 #   bash install.sh --token <TOKEN>       # supply MCP token up front
 #   bash install.sh --mcp-only --all      # all MCPs, no checklist
 #   bash install.sh --skip-mcp            # skip MCP step entirely
+#   bash install.sh --keep-local          # don't reset repos with uncommitted edits
+#   bash install.sh -y                    # auto-accept every [Y/n] prompt
 #
 # Environment:
 #   FIDO_MCP_TOKEN=<T>     same as --token
 #   SKIP_MCP_INSTALL=1     same as --skip-mcp
+#   FIDO_KEEP_LOCAL=1      same as --keep-local
+#   FIDO_ASSUME_YES=1      same as -y / --yes
 #   FIDO_INSTALL_DIR=<D>   where to put fido-agent/  (default: $HOME when piped,
 #                          else the script's directory)
 #
@@ -33,22 +37,38 @@ MCP_MODE="interactive"
 MCP_ONLY_LIST=""
 MCP_DRY_RUN=0
 MCP_SKIP_DNS=0
+# --keep-local: when re-running on a developer box, leave repos with
+# uncommitted edits alone (still git fetch, just skip reset --hard).
+# Default 0 keeps the existing fresh-laptop curl|bash flow unchanged.
+KEEP_LOCAL="${FIDO_KEEP_LOCAL:-0}"
+KEPT_LOCAL=0
+# --yes: auto-accept default for [Y/n] prompts. Risky prompts (per-MCP
+# overwrite, missing token) deliberately do NOT auto-accept under --yes;
+# see install_one() and the token check below.
+ASSUME_YES="${FIDO_ASSUME_YES:-0}"
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --mcp-only)  MCP_ONLY=1; shift ;;
-        --skip-mcp)  SKIP_MCP=1; shift ;;
-        --token)     MCP_TOKEN="$2"; shift 2 ;;
-        --all)       MCP_MODE="all"; shift ;;
-        --only)      MCP_MODE="only"; MCP_ONLY_LIST="${2:-}"; shift 2 ;;
-        --dry-run)   MCP_DRY_RUN=1; shift ;;
-        --skip-dns)  MCP_SKIP_DNS=1; shift ;;
-        -h|--help)   sed -n '2,22p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
-        *)           echo "Unknown flag: $1" >&2; exit 2 ;;
+        --mcp-only)    MCP_ONLY=1; shift ;;
+        --skip-mcp)    SKIP_MCP=1; shift ;;
+        --token)       MCP_TOKEN="$2"; shift 2 ;;
+        --all)         MCP_MODE="all"; shift ;;
+        --only)        MCP_MODE="only"; MCP_ONLY_LIST="${2:-}"; shift 2 ;;
+        --dry-run)     MCP_DRY_RUN=1; shift ;;
+        --skip-dns)    MCP_SKIP_DNS=1; shift ;;
+        --keep-local)  KEEP_LOCAL=1; shift ;;
+        -y|--yes)      ASSUME_YES=1; shift ;;
+        -h|--help)     sed -n '2,26p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        *)             echo "Unknown flag: $1" >&2; exit 2 ;;
     esac
 done
 
 ORG="FidoMoney"
+# INSTALLER_VERSION — date-based string surfaced under the banner so
+# support tickets can pin which `main` revision a user actually ran.
+# Distribution is `curl|bash` from main, so there's no in-script git
+# introspection. Bump this in the same commit as any user-facing change.
+INSTALLER_VERSION="2026.05.10"
 
 # Internal DNS zones the VPN tunnel exposes. MCP servers live under
 # global-private.fido.money; private.fido.money serves the data backends
@@ -207,7 +227,7 @@ print_banner() {
     echo -e "${BOLD}${PINK}  / /_  / / __  / __ \\    / // __ \\/ ___/ __/ __ \`/ / / _ \\/ ___/${NC}"
     echo -e "${BOLD}${PINK} / __/ / / /_/ / /_/ /  _/ // / / (__  ) /_/ /_/ / / /  __/ /    ${NC}"
     echo -e "${BOLD}${PINK}/_/   /_/\\__,_/\\____/  /___/_/ /_/____/\\__/\\__,_/_/_/\\___/_/     ${NC}"
-    echo -e "${DIM}                                                  by platform team${NC}"
+    echo -e "${DIM}                                       by platform team · v${INSTALLER_VERSION}${NC}"
     echo ""
 }
 
@@ -223,7 +243,7 @@ echo ""
 # Upfront preamble — what's about to happen, and what touches the system,
 # so the user has a chance to bail before sudo/network calls. Skipped in
 # --mcp-only mode (smaller scope) and in non-interactive runs.
-if [ "$MCP_ONLY" = "0" ] && [ -t 0 ]; then
+if [ "$MCP_ONLY" = "0" ] && [ -t 0 ] && [ "$ASSUME_YES" = "0" ]; then
     echo -e "${BOLD}This installer will:${NC}"
     echo "  • Install Homebrew packages: gh, fzf, AWS VPN Client (cask)"
     echo "  • Install AWS CLI from Amazon's official pkg (awscli.amazonaws.com)"
@@ -260,11 +280,20 @@ if ! command -v git &> /dev/null; then
     info "A popup will appear — click ${BOLD}Install${NC} and wait for it to finish."
     xcode-select --install 2>/dev/null || true
 
-    waited=0
+    # Braille spinner so the user sees progress instead of a frozen screen
+    # while xcode-select chugs in the background. Same frame set as
+    # clone_with_spinner — keep them in sync. 15 min cap with a recovery
+    # hint if the popup got dismissed.
+    frames=('⠋' '⠙' '⠹' '⠸' '⠼' '⠴' '⠦' '⠧' '⠇' '⠏')
+    waited=0; i=0
     until command -v git &> /dev/null; do
-        sleep 5
-        waited=$((waited + 5))
+        printf "\r  ${BLUE}%s${NC} Waiting for Command Line Tools install (%dm)..." \
+            "${frames[i % ${#frames[@]}]}" "$((waited / 60))"
+        sleep 1
+        waited=$((waited + 1))
+        i=$((i + 1))
         if [ "$waited" -ge 900 ]; then
+            printf "\r  ${RED}✖${NC} Waiting for Command Line Tools install... ${RED}timed out${NC}    \n"
             fail "Timed out waiting for the Command Line Tools install (15 min)."
             fail "If you dismissed the popup, run this in another terminal:"
             fail "  ${BOLD}xcode-select --install${NC}"
@@ -272,6 +301,7 @@ if ! command -v git &> /dev/null; then
             exit 1
         fi
     done
+    printf "\r  ${GREEN}✔${NC} Waiting for Command Line Tools install... ${GREEN}done${NC}      \n"
     success "Developer tools installed"
 else
     success "git is installed"
@@ -820,7 +850,10 @@ else
     echo ""
     info "AWS VPN Client needs a Fido profile (.ovpn file) to connect."
 
-    if [ -t 0 ]; then
+    # --yes has no safe default for the VPN profile (the user has to paste
+    # config or supply a path). Skip the prompt and tell them to add it
+    # manually later — same as the non-tty branch below.
+    if [ -t 0 ] && [ "$ASSUME_YES" = "0" ]; then
         vpn_choice=$(fzf_pick "AWS VPN profile" \
             "Paste config (.ovpn content) — read until Ctrl-D" \
             "Provide a path to a .ovpn file" \
@@ -929,26 +962,38 @@ echo ""
 
 if [ -d "${AGENT_REPO_DIR}/.git" ]; then
     info "fido-agent already cloned — pulling latest..."
-    cd "$AGENT_REPO_DIR"
-    git fetch --all --prune --quiet 2>/dev/null
-    DEFAULT_BRANCH=$(git symbolic-ref refs/remotes/origin/HEAD 2>/dev/null | sed 's@^refs/remotes/origin/@@')
-    if [ -z "$DEFAULT_BRANCH" ]; then
-        for branch in main master develop; do
-            if git rev-parse --verify "origin/${branch}" &>/dev/null; then
-                DEFAULT_BRANCH="$branch"
-                break
-            fi
-        done
-    fi
-    if [ -n "$DEFAULT_BRANCH" ]; then
-        git checkout "$DEFAULT_BRANCH" --quiet 2>/dev/null || true
-        if [ -n "$(git status --porcelain 2>/dev/null)" ]; then
-            warn "fido-agent — discarding uncommitted local changes ($(git status --porcelain 2>/dev/null | wc -l | tr -d ' ') file(s))"
+    # pushd over `cd` so a failed entry doesn't abort under `set -e` and
+    # so we always pop back where we were even when subcommands warn.
+    if pushd "$AGENT_REPO_DIR" >/dev/null 2>&1; then
+        git fetch --all --prune --quiet 2>/dev/null
+        DEFAULT_BRANCH=$(git symbolic-ref refs/remotes/origin/HEAD 2>/dev/null | sed 's@^refs/remotes/origin/@@')
+        if [ -z "$DEFAULT_BRANCH" ]; then
+            for branch in main master develop; do
+                if git rev-parse --verify "origin/${branch}" &>/dev/null; then
+                    DEFAULT_BRANCH="$branch"
+                    break
+                fi
+            done
         fi
-        git reset --hard "origin/${DEFAULT_BRANCH}" --quiet 2>/dev/null || true
+        if [ -n "$DEFAULT_BRANCH" ]; then
+            git checkout "$DEFAULT_BRANCH" --quiet 2>/dev/null || true
+            dirty=0
+            [ -n "$(git status --porcelain 2>/dev/null)" ] && dirty=1
+            if [ "$dirty" = "1" ] && [ "$KEEP_LOCAL" = "1" ]; then
+                warn "fido-agent — uncommitted changes; --keep-local set, leaving as-is"
+                KEPT_LOCAL=$((KEPT_LOCAL + 1))
+            else
+                if [ "$dirty" = "1" ]; then
+                    warn "fido-agent — discarding uncommitted local changes ($(git status --porcelain 2>/dev/null | wc -l | tr -d ' ') file(s))"
+                fi
+                git reset --hard "origin/${DEFAULT_BRANCH}" --quiet 2>/dev/null || true
+            fi
+        fi
+        popd >/dev/null 2>&1 || true
+        success "fido-agent updated"
+    else
+        warn "Could not enter ${AGENT_REPO_DIR} — skipping fido-agent update"
     fi
-    cd "$SCRIPT_DIR"
-    success "fido-agent updated"
 else
     if clone_with_spinner "fido-agent" "${ORG}/fido-agent" "$AGENT_REPO_DIR"; then
         success "fido-agent cloned"
@@ -974,7 +1019,7 @@ info "The installer can clone every Fido team repo (listed in roman-repos.txt)"
 info "into ${BOLD}${ROMAN_DIR}${NC} so Claude can browse them locally. This can take a while."
 echo ""
 
-if [ -t 0 ]; then
+if [ -t 0 ] && [ "$ASSUME_YES" = "0" ]; then
     read -r -p "$(echo -e "  Clone all repositories now? [Y/n] ")" reply
     case "${reply:-Y}" in
         n|N|no|NO) SKIP_REPOS=1; info "Skipped — rerun the installer to clone them."; echo "" ;;
@@ -1079,7 +1124,14 @@ for dir in "${ROMAN_DIR}"/*/; do
     if [ -d "${dir}/.git" ]; then
         REPO_NAME=$(basename "$dir")
 
-        cd "$dir"
+        # pushd so a failed entry doesn't abort under `set -e`. Pair every
+        # `continue` below with a popd. The previous `cd ... ; cd ROMAN_DIR`
+        # pattern silently aborted the loop on a deleted ROMAN_DIR.
+        if ! pushd "$dir" >/dev/null 2>&1; then
+            warn "${REPO_NAME} — could not enter directory, skipping"
+            UPDATE_FAILED=$((UPDATE_FAILED + 1))
+            continue
+        fi
 
         DEFAULT_BRANCH=$(git symbolic-ref refs/remotes/origin/HEAD 2>/dev/null | sed 's@^refs/remotes/origin/@@')
         if [ -z "$DEFAULT_BRANCH" ]; then
@@ -1092,13 +1144,22 @@ for dir in "${ROMAN_DIR}"/*/; do
         fi
 
         if [ -z "$DEFAULT_BRANCH" ]; then
-            cd "${ROMAN_DIR}"
+            popd >/dev/null 2>&1 || true
             continue
         fi
 
         CURRENT_BRANCH=$(git branch --show-current 2>/dev/null || echo "")
 
         if [ -n "$(git status --porcelain 2>/dev/null)" ]; then
+            if [ "$KEEP_LOCAL" = "1" ]; then
+                # --keep-local: warn but DON'T reset/clean. We still ran
+                # `git fetch` earlier so `git status` will show the user
+                # they're behind origin — they can rebase manually.
+                warn "${REPO_NAME} — uncommitted changes; --keep-local set, leaving as-is ($(git status --porcelain 2>/dev/null | wc -l | tr -d ' ') file(s))"
+                KEPT_LOCAL=$((KEPT_LOCAL + 1))
+                popd >/dev/null 2>&1 || true
+                continue
+            fi
             warn "${REPO_NAME} — discarding uncommitted local changes (was: $(git status --porcelain 2>/dev/null | wc -l | tr -d ' ') file(s))"
             git reset --hard HEAD --quiet 2>/dev/null || true
             git clean -fd --quiet 2>/dev/null || true
@@ -1108,7 +1169,7 @@ for dir in "${ROMAN_DIR}"/*/; do
             git checkout "$DEFAULT_BRANCH" --quiet 2>/dev/null || {
                 warn "${REPO_NAME} — could not switch to ${DEFAULT_BRANCH}"
                 UPDATE_FAILED=$((UPDATE_FAILED + 1))
-                cd "${ROMAN_DIR}"
+                popd >/dev/null 2>&1 || true
                 continue
             }
         fi
@@ -1120,7 +1181,7 @@ for dir in "${ROMAN_DIR}"/*/; do
             UPDATE_FAILED=$((UPDATE_FAILED + 1))
         fi
 
-        cd "${ROMAN_DIR}"
+        popd >/dev/null 2>&1 || true
     fi
 done
 
@@ -1225,7 +1286,7 @@ echo ""
 DEFAULT_SKILLS_DIR="${HOME}/.claude/skills/fido"
 COLOCATED_SKILLS_DIR="${HOME}/fido-money/skills-repo"
 
-if [ -t 0 ]; then
+if [ -t 0 ] && [ "$ASSUME_YES" = "0" ]; then
     skills_choice=$(fzf_pick "Where to clone FidoMoney/skills" \
         "${DEFAULT_SKILLS_DIR}  (user-scope, picked up by every Claude session)" \
         "${COLOCATED_SKILLS_DIR}  (colocated with the install)" \
@@ -1270,8 +1331,9 @@ echo ""
 if [ "$SKIP_REPOS" = "1" ]; then
     info "Per-team repos: skipped"
 else
-    [ "$CLONED" -gt 0 ]       && success "New repos cloned:   ${CLONED}"
+    [ "$CLONED" -gt 0 ]        && success "New repos cloned:   ${CLONED}"
     success "Repos up to date:   ${UPDATED}"
+    [ "$KEPT_LOCAL" -gt 0 ]    && warn "Kept (local edits): ${KEPT_LOCAL} (--keep-local; rebase manually)"
     [ "$UPDATE_FAILED" -gt 0 ] && warn "Need attention:     ${UPDATE_FAILED}"
     [ "$CLONE_FAILED" -gt 0 ]  && warn "Clone failures:     ${CLONE_FAILED} (check access permissions)"
 fi
@@ -1347,7 +1409,7 @@ info "You'll need: ${BOLD}VPN ON${NC} and the ${BOLD}Fido MCP bearer token${NC} 
 echo ""
 
 # Prompt y/N only in full-setup interactive mode (skip in --mcp-only).
-if [ "$MCP_ONLY" = "0" ] && [ -t 0 ]; then
+if [ "$MCP_ONLY" = "0" ] && [ -t 0 ] && [ "$ASSUME_YES" = "0" ]; then
     read -r -p "$(echo -e "  Install MCP servers now? [Y/n] ")" reply
     case "${reply:-Y}" in
         y|Y|yes|YES) ;;
@@ -1390,8 +1452,13 @@ success "Found ${BOLD}${#MCP_CATALOG[@]}${NC} MCP servers"
 echo ""
 
 # Quick "install all" shortcut. Skipped when --all/--only already pinned a
-# selection or when stdin isn't interactive.
-if [ "$MCP_MODE" = "interactive" ] && [ -t 0 ]; then
+# selection or when stdin isn't interactive. Under --yes, promote to "all"
+# without prompting — explicit --all / --only still take precedence
+# because they pin MCP_MODE before we reach this gate.
+if [ "$MCP_MODE" = "interactive" ] && [ "$ASSUME_YES" = "1" ]; then
+    MCP_MODE="all"
+    info "Installing all MCPs (--yes implies install-all default)..."
+elif [ "$MCP_MODE" = "interactive" ] && [ -t 0 ]; then
     echo -e "${BOLD}Quick option:${NC} install ${BOLD}all ${#MCP_CATALOG[@]}${NC} MCP servers in one shot."
     echo -e "${DIM}  • Press ${NC}${BOLD}Y${NC}${DIM} (or Enter) to install everything${NC}"
     echo -e "${DIM}  • Press ${NC}${BOLD}N${NC}${DIM} to pick servers from a list${NC}"
@@ -1403,9 +1470,11 @@ if [ "$MCP_MODE" = "interactive" ] && [ -t 0 ]; then
     echo ""
 fi
 
-# Token — flag / env / prompt.
+# Token — flag / env / prompt. Under --yes we deliberately do NOT prompt
+# (--yes is for unattended runs; the token must come from --token / env).
+# The fail-fast block below catches the missing-token case.
 if [ -z "$MCP_TOKEN" ]; then
-    if [ -t 0 ]; then
+    if [ -t 0 ] && [ "$ASSUME_YES" = "0" ]; then
         info "Paste the Fido MCP bearer token (input hidden):"
         read -r -s -p "  > " MCP_TOKEN
         echo ""
@@ -1525,12 +1594,15 @@ install_one() {
         # makes our stdin the piped MCP list, so `read` without /dev/tty would
         # never see the user. Truly non-interactive runs (no tty) default to
         # "keep" to avoid silently clobbering someone's existing config.
+        # --yes intentionally does NOT auto-overwrite here — that would let
+        # `--yes` silently rewrite a working user's MCP config with a
+        # possibly-wrong token. Treat --yes the same as no-tty: keep.
         local reply decision="no"
         # `[ -r /dev/tty ]` isn't enough on macOS — the device file is always
         # readable, but opening it fails ("Device not configured") when no
         # controlling terminal is attached (e.g. CI, nohup, this Claude shell).
         # Probe with a real open in a subshell instead.
-        if (exec </dev/tty) 2>/dev/null; then
+        if [ "$ASSUME_YES" = "0" ] && (exec </dev/tty) 2>/dev/null; then
             read -r -p "$(echo -e "  ${YELLOW}?${NC} ${BOLD}${name}${NC} already configured. Overwrite? [y/N] ")" reply </dev/tty
             case "${reply:-}" in
                 y|Y|yes|YES) decision="yes" ;;

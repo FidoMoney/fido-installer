@@ -98,10 +98,31 @@ jobs:
           # they parse / load. Avoids running the install flow itself
           # (which would try to install winget packages and clone Fido
           # repos the runner has no access to).
+          #
+          # The list is the side-effect-free helpers the smoke step below
+          # actually invokes — keep it in sync with that block. The
+          # min-count gate catches the silent-failure mode where a rename
+          # silently shrinks the extracted set: bump $expectedMin
+          # deliberately when adding/removing helpers.
           $src = Get-Content -Raw .\install.ps1
-          $helperRegex = '(?ms)^function\s+(Print-Banner|Test-Admin|Refresh-Path|Has-Cmd|Test-VpnUp|Configure-DnsResolvers|Connect-Vpn|Select-One|Build-McpCatalog|Install-WingetPkg|Select-McpsFzf|Select-McpsNumbered|Test-Known)\b.*?^\}'
+          $helperNames = @(
+            'Print-Banner', 'Test-Admin', 'Refresh-Path', 'Has-Cmd',
+            'Test-VpnUp', 'Configure-DnsResolvers', 'Connect-Vpn',
+            'Select-One', 'Build-McpCatalog', 'Install-WingetPkg',
+            'Select-McpsFzf', 'Select-McpsNumbered', 'Test-Known'
+          )
+          $expectedMin = $helperNames.Count
+          $alt = ($helperNames | ForEach-Object { [regex]::Escape($_) }) -join '|'
+          $helperRegex = "(?ms)^function\s+($alt)\b.*?^\}"
           $helpers = [regex]::Matches($src, $helperRegex) | ForEach-Object { $_.Value }
-          if (-not $helpers) { throw "no helpers extracted — regex needs updating" }
+          if ($helpers.Count -lt $expectedMin) {
+            $found = ($helpers | ForEach-Object {
+              if ($_ -match '^function\s+(\S+)') { $Matches[1] }
+            }) -join ', '
+            throw ("Expected >= $expectedMin helpers, extracted $($helpers.Count). " +
+                   "Found: [$found]. A helper was renamed/removed — update the " +
+                   "name list above and adjust `$expectedMin to match.")
+          }
           $tmp = Join-Path $env:RUNNER_TEMP 'helpers.ps1'
           # Module-scope vars referenced by helpers
           @"
