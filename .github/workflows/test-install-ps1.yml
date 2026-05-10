@@ -130,23 +130,33 @@ jobs:
                    "name list above and adjust `$expectedMin to match.")
           }
           $tmp = Join-Path $env:RUNNER_TEMP 'helpers.ps1'
-          # Module-scope vars referenced by helpers
-          @"
-`$ErrorActionPreference = 'Stop'
-`$MCP_DNS_DOMAIN = 'global-private.fido.money'
-`$MCP_DNS_ZONES  = @(
-    @{ Zone = 'global-private.fido.money'; Server = '10.3.0.2' }
-    @{ Zone = 'private.fido.money';        Server = '10.30.0.2' }
-)
-`$MCP_GITOPS_REPO = 'FidoMoney/platform-team-gitops'
-`$MCP_GITOPS_PATH = 'applications/mcp-servers'
-`$SkipDns = `$true
-`$DryRun = `$true
-function Write-Info  { param([string]`$m) Write-Host `$m }
-function Write-OK    { param([string]`$m) Write-Host `$m }
-function Write-Warn2 { param([string]`$m) Write-Host `$m }
-function Write-Fail  { param([string]`$m) Write-Host `$m }
-"@ | Set-Content $tmp
+          # Module-scope vars + stub Write-* helpers referenced by the
+          # extracted helpers below. This used to be a `@" ... "@`
+          # here-string with column-0 backtick-escapes, but a column-0
+          # line inside a YAML `|` block scalar is interpreted as ending
+          # the scalar (every line in the block must be indented at
+          # least to the scalar's indent level). GitHub's YAML parser
+          # tolerated it for a while; the current one rejects with
+          # `Invalid workflow file ... line N`. An indented array of
+          # single-quoted strings keeps every line at the YAML indent
+          # level and drops the backtick noise.
+          $headerLines = @(
+            '$ErrorActionPreference = ''Stop'''
+            '$MCP_DNS_DOMAIN = ''global-private.fido.money'''
+            '$MCP_DNS_ZONES  = @('
+            '    @{ Zone = ''global-private.fido.money''; Server = ''10.3.0.2'' }'
+            '    @{ Zone = ''private.fido.money'';        Server = ''10.30.0.2'' }'
+            ')'
+            '$MCP_GITOPS_REPO = ''FidoMoney/platform-team-gitops'''
+            '$MCP_GITOPS_PATH = ''applications/mcp-servers'''
+            '$SkipDns = $true'
+            '$DryRun = $true'
+            'function Write-Info  { param([string]$m) Write-Host $m }'
+            'function Write-OK    { param([string]$m) Write-Host $m }'
+            'function Write-Warn2 { param([string]$m) Write-Host $m }'
+            'function Write-Fail  { param([string]$m) Write-Host $m }'
+          )
+          $headerLines | Set-Content $tmp
           ($helpers -join "`n`n") | Add-Content $tmp
           . $tmp
           # Smoke-test the cheap, side-effect-free helpers
