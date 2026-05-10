@@ -531,16 +531,36 @@ PY
 }
 
 # Validate the token by listing accounts. Prints the account count on
-# stdout, returns 0 if ≥1 account, 1 otherwise (or on HTTP failure).
+# stdout. Returns:
+#   0 = OK, ≥1 account
+#   2 = OK, 0 accounts (token valid but no AWS access assigned)
+#   3 = API call failed (network or non-2xx response). Prints status+body
+#       snippet to stderr so the failure is diagnosable instead of being
+#       silently mis-reported as "no accounts".
 sso_list_accounts() {
-    local token="$1" resp
-    resp=$(curl -fsS -H "x-amz-sso_bearer_token: ${token}" \
-        "${SSO_PORTAL_URL}/federation/list-accounts?max_result=100") || return 1
+    local token="$1" body_file status body snippet
+    body_file=$(mktemp -t fido-sso-la) || return 3
+    status=$(curl -sS -o "$body_file" -w '%{http_code}' \
+        -H "x-amz-sso_bearer_token: ${token}" \
+        "${SSO_PORTAL_URL}/federation/list-accounts?max_result=100" 2>/dev/null) || {
+        warn "Could not reach ${SSO_PORTAL_URL}/federation/list-accounts (curl failed)"
+        rm -f "$body_file"
+        return 3
+    }
+    body=$(cat "$body_file" 2>/dev/null)
+    rm -f "$body_file"
+    if [ "$status" != "200" ]; then
+        warn "list-accounts returned HTTP ${status} from ${SSO_PORTAL_URL}"
+        snippet=$(printf '%s' "$body" | tr -d '\n' | head -c 200)
+        [ -n "$snippet" ] && warn "  body: ${snippet}"
+        return 3
+    fi
     python3 -c '
 import json, sys
-n = len(json.load(sys.stdin).get("accountList", []))
-print(n); sys.exit(0 if n > 0 else 1)
-' <<<"$resp"
+try:    n = len(json.load(sys.stdin).get("accountList", []))
+except Exception: n = 0
+print(n); sys.exit(0 if n > 0 else 2)
+' <<<"$body"
 }
 
 # Have the user pick an (account, role). On success prints
@@ -632,7 +652,7 @@ PY
 # session short-circuits; otherwise run the device flow and (for new
 # users) write a default profile.
 ensure_fido_sso() {
-    local token n cfg picked account_id account_name role_name
+    local token n cfg picked account_id account_name role_name la_rc
 
     if token=$(sso_cached_token); then
         success "Active Fido SSO session found"
@@ -648,28 +668,51 @@ ensure_fido_sso() {
     info "Starting Fido AWS SSO sign-in (no AWS CLI required)..."
     token=$(sso_oidc_login) || return 1
 
+    # Validate the token by listing AWS accounts. Three outcomes:
+    #   rc=0 → ≥1 account assigned, all good
+    #   rc=2 → token valid but 0 accounts (real "no AWS access")
+    #   rc=3 → portal API error (404/5xx/network). The token is still
+    #          valid for downstream use, so we warn and continue rather
+    #          than aborting the whole installer over an unreachable
+    #          validation endpoint.
     info "Validating Fido AWS account access..."
-    if ! n=$(sso_list_accounts "$token"); then
-        fail "Sign-in succeeded but no AWS accounts are assigned to your Fido SSO user."
-        return 1
-    fi
-    success "Fido SSO sign-in succeeded — ${BOLD}${n}${NC} account(s) available"
+    n=$(sso_list_accounts "$token"); la_rc=$?
+    case "$la_rc" in
+        0)
+            success "Fido SSO sign-in succeeded — ${BOLD}${n}${NC} account(s) available"
+            ;;
+        2)
+            fail "Sign-in succeeded but no AWS accounts are assigned to your Fido SSO user."
+            return 1
+            ;;
+        *)
+            warn "Couldn't validate AWS account list — portal API didn't respond cleanly."
+            warn "Your SSO token is cached and the rest of the installer will continue."
+            warn "If \`aws sts get-caller-identity\` later fails, run: aws sso login --sso-session ${FIDO_SSO_NAME}"
+            n=""
+            ;;
+    esac
 
     cfg="${AWS_CONFIG_FILE:-${HOME}/.aws/config}"
     if [ ! -s "$cfg" ] || ! grep -q 'fido\.awsapps\.com/start' "$cfg" 2>/dev/null; then
-        info "Picking a default AWS account+role for the ${BOLD}${FIDO_SSO_NAME}${NC} profile..."
-        if picked=$(sso_pick_account_role "$token"); then
-            account_id=$(awk -F'\t' '{print $1}' <<<"$picked")
-            account_name=$(awk -F'\t' '{print $2}' <<<"$picked")
-            role_name=$(awk -F'\t' '{print $3}' <<<"$picked")
-            if sso_write_config "$account_id" "$role_name"; then
-                success "Wrote profile ${BOLD}${FIDO_SSO_NAME}${NC} → ${account_name} (${role_name})"
-                info "To make this your default, add ${BOLD}export AWS_PROFILE=${FIDO_SSO_NAME}${NC} to your shell rc."
+        if [ "$la_rc" = "0" ]; then
+            info "Picking a default AWS account+role for the ${BOLD}${FIDO_SSO_NAME}${NC} profile..."
+            if picked=$(sso_pick_account_role "$token"); then
+                account_id=$(awk -F'\t' '{print $1}' <<<"$picked")
+                account_name=$(awk -F'\t' '{print $2}' <<<"$picked")
+                role_name=$(awk -F'\t' '{print $3}' <<<"$picked")
+                if sso_write_config "$account_id" "$role_name"; then
+                    success "Wrote profile ${BOLD}${FIDO_SSO_NAME}${NC} → ${account_name} (${role_name})"
+                    info "To make this your default, add ${BOLD}export AWS_PROFILE=${FIDO_SSO_NAME}${NC} to your shell rc."
+                else
+                    warn "Couldn't write ~/.aws/config — run \`aws configure sso\` later if you want a CLI profile."
+                fi
             else
-                warn "Couldn't write ~/.aws/config — run \`aws configure sso\` later if you want a CLI profile."
+                warn "Skipped account/role picker — run \`aws configure sso\` later if you want a CLI profile."
             fi
         else
-            warn "Skipped account/role picker — run \`aws configure sso\` later if you want a CLI profile."
+            warn "Skipping AWS profile picker (validation API was unreachable)."
+            info "Run ${BOLD}aws configure sso --profile ${FIDO_SSO_NAME}${NC} after install if you want a CLI profile."
         fi
     else
         success "Fido SSO already in ~/.aws/config — refreshed session cache"
