@@ -104,11 +104,17 @@ jobs:
           # min-count gate catches the silent-failure mode where a rename
           # silently shrinks the extracted set: bump $expectedMin
           # deliberately when adding/removing helpers.
+          #
+          # NB: only top-level (column-0) `function NAME { ... }` blocks
+          # are extractable here. `Install-WingetPkg` is intentionally
+          # excluded because it lives nested inside the `if (-not $McpOnly)`
+          # block — we can't safely extract a nested function with a
+          # column-0 regex, and the smoke calls below don't need it.
           $src = Get-Content -Raw .\install.ps1
           $helperNames = @(
             'Print-Banner', 'Test-Admin', 'Refresh-Path', 'Has-Cmd',
             'Test-VpnUp', 'Configure-DnsResolvers', 'Connect-Vpn',
-            'Select-One', 'Build-McpCatalog', 'Install-WingetPkg',
+            'Select-One', 'Build-McpCatalog',
             'Select-McpsFzf', 'Select-McpsNumbered', 'Test-Known'
           )
           $expectedMin = $helperNames.Count
