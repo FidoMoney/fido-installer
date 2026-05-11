@@ -46,6 +46,18 @@ When it finishes:
 cd ~/fido-money && claude
 ```
 
+## Windows
+
+Windows has its own PowerShell flow — same VPN, DNS zones, and MCP catalog as macOS, but uses `winget` instead of Homebrew and Windows NRPT rules instead of `/etc/resolver/`.
+
+Open PowerShell **as Administrator** and run:
+
+```powershell
+iex (irm https://raw.githubusercontent.com/FidoMoney/fido-installer/main/install.ps1)
+```
+
+Full prereqs (App Installer, AWS VPN client, MCP token), flag reference, and troubleshooting: [WINDOWS.md](WINDOWS.md).
+
 ## Common variations
 
 | What you want                        | Command                                                                                                   |
