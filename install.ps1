@@ -84,11 +84,37 @@ function Test-Admin {
 }
 
 function Refresh-Path {
+    # The official Claude Code installer drops the binary into ~\.local\bin,
+    # which is not in Machine or User PATH by default — add it explicitly so
+    # `claude` is visible to this process right after install.
+    $local = Join-Path $HOME '.local\bin'
     $env:Path = [System.Environment]::GetEnvironmentVariable('Path','Machine') + ';' +
-                [System.Environment]::GetEnvironmentVariable('Path','User')
+                [System.Environment]::GetEnvironmentVariable('Path','User')    + ';' +
+                $local
 }
 
 function Has-Cmd { param([string]$Name) [bool](Get-Command $Name -ErrorAction SilentlyContinue) }
+
+# `iex (irm …)` runs this script inside the host PowerShell process, so a
+# bare top-level `exit N` slams the host window shut — the user sees the
+# console disappear with no error. Stop-Script keeps that from happening:
+# when the script is run from a downloaded file, it exits normally; when
+# piped through iex, it throws a tagged exception that the script-level
+# trap below catches and unwinds to the user's prompt instead of killing it.
+$script:RunningFromFile = [string]::IsNullOrEmpty($MyInvocation.MyCommand.Path) -eq $false
+
+function Stop-Script { param([int]$Code = 0)
+    if ($script:RunningFromFile) { exit $Code }
+    throw ([System.Management.Automation.RuntimeException]::new("__FIDO_INSTALLER_HALT__:$Code"))
+}
+
+trap [System.Management.Automation.RuntimeException] {
+    if ($_.Exception.Message -match '^__FIDO_INSTALLER_HALT__:(-?\d+)$') {
+        $rc = [int]$Matches[1]
+        if ($script:RunningFromFile) { exit $rc }
+        return
+    }
+}
 
 # Run `gh repo clone $Remote $Dest` with an animated spinner so the user can
 # see progress instead of staring at a frozen "Cloning…" line. Returns gh's
@@ -300,7 +326,7 @@ if (-not $McpOnly) {
         Write-Info "  3) Ask #eng-platform on Slack — IT can install it remotely."
         Write-Host ""
         Write-Info "Once winget is available, re-run this script."
-        exit 1
+        Stop-Script 1
     }
     Write-OK "winget is available"
 
@@ -741,13 +767,13 @@ if (-not $McpOnly) {
         Write-Info "  Re-run this installer and complete the SSO step in your browser."
         Write-Host ""
         Write-Fail "Aborting installer — re-run once SSO sign-in succeeds."
-        exit 1
+        Stop-Script 1
     }
 
     # Install the AWS CLI for downstream use. The OIDC cache we just
     # wrote is in the format the CLI expects, so the user's first
     # `aws` command inherits the live session — no second login.
-    if (-not (Ensure-AwsCli)) { exit 1 }
+    if (-not (Ensure-AwsCli)) { Stop-Script 1 }
 
     # ── AWS VPN Client profile ───────────────────────────────────
     # Skip the prompt entirely if AWS VPN Client already has at least
@@ -1016,14 +1042,14 @@ if (-not $McpOnly) {
             Write-OK "fido-agent cloned"
         } else {
             Write-Fail "Could not clone fido-agent — check your access permissions"
-            exit 1
+            Stop-Script 1
         }
     }
     Write-Host ""
 
     if (-not (Test-Path $RomanDir)) {
         Write-Fail "Expected roman\ directory inside fido-agent but it doesn't exist"
-        exit 1
+        Stop-Script 1
     }
     Write-OK "Agents folder ready: $RomanDir"
     Write-Host ""
@@ -1033,7 +1059,7 @@ if (-not $McpOnly) {
     if (-not (Test-Path $repoListFile)) {
         Write-Fail "Repo list not found: $repoListFile"
         Write-Fail "Expected it to ship with fido-agent. Ask #eng-platform."
-        exit 1
+        Stop-Script 1
     }
     $repos = Get-Content $repoListFile |
         ForEach-Object { ($_ -split '#', 2)[0].Trim() } |
@@ -1307,7 +1333,7 @@ if ($SkipMcp) {
         Write-Host "  To use agents:  cd $HOME\fido-money; claude" -ForegroundColor White
         Write-Host ""
     }
-    exit 0
+    Stop-Script 0
 }
 
 Write-Host "── Fido MCP servers (Datadog, Snowflake, Slack, Mambu, ...) ──" -ForegroundColor White
@@ -1322,22 +1348,26 @@ if (-not $McpOnly -and (Test-Interactive)) {
     if ($reply -notmatch '^(y|Y|yes|YES)$') {
         Write-Info "Skipped. Run later: powershell -ExecutionPolicy Bypass -File .\install.ps1 -McpOnly"
         Write-Host ""
-        exit 0
+        Stop-Script 0
     }
 }
 
+# Re-read PATH from the registry (and add ~\.local\bin) before checking for
+# claude/gh — winget and the Claude installer just touched the user PATH and
+# the current process may not have picked them up yet.
+Refresh-Path
 if (-not (Has-Cmd 'claude')) {
     Write-Fail "'claude' CLI not found on PATH. Open a new terminal and rerun."
-    exit 1
+    Stop-Script 1
 }
 if (-not (Has-Cmd 'gh')) {
     Write-Fail "'gh' CLI not found. Run the full installer first (without -McpOnly)."
-    exit 1
+    Stop-Script 1
 }
 & gh auth status *> $null
 if ($LASTEXITCODE -ne 0) {
     Write-Fail "'gh' not authenticated. Run: gh auth login  then rerun."
-    exit 1
+    Stop-Script 1
 }
 
 Write-Info "Reading MCP catalog from $MCP_GITOPS_REPO/$MCP_GITOPS_PATH..."
@@ -1345,7 +1375,7 @@ $catalog = Build-McpCatalog
 if (-not $catalog -or $catalog.Count -eq 0) {
     Write-Fail "Could not read MCP catalog from $MCP_GITOPS_REPO."
     Write-Fail "Check that your GitHub account has access to that repo."
-    exit 1
+    Stop-Script 1
 }
 Write-OK "Found $($catalog.Count) MCP servers"
 Write-Host ""
@@ -1369,7 +1399,7 @@ if (-not $Token) {
 }
 if (-not $Token) {
     Write-Fail "No token. Pass -Token <T> or set FIDO_MCP_TOKEN."
-    exit 1
+    Stop-Script 1
 }
 Write-OK "Token loaded (length=$($Token.Length))"
 Write-Host ""
@@ -1403,7 +1433,7 @@ function Select-McpsNumbered {
         $input = Read-Host ">"
         if (-not $input) { break }
         switch -Regex ($input) {
-            '^(q|Q)$' { exit 0 }
+            '^(q|Q)$' { Stop-Script 0 }
             '^(a|A)$' { for ($k = 0; $k -lt $catalog.Count; $k++) { $sel[$k] = $true } ; continue }
             '^(n|N)$' { for ($k = 0; $k -lt $catalog.Count; $k++) { $sel[$k] = $false } ; continue }
             '^(i|I)$' { for ($k = 0; $k -lt $catalog.Count; $k++) { $sel[$k] = -not $sel[$k] } ; continue }
@@ -1437,7 +1467,7 @@ switch ($McpMode) {
 
 if (-not $selected -or $selected.Count -eq 0) {
     Write-Warn2 "Nothing selected — exiting"
-    exit 0
+    Stop-Script 0
 }
 
 Write-Host ""
